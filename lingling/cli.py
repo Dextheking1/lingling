@@ -686,6 +686,71 @@ def _spawn_geoip_fallback() -> None:
     threading.Thread(target=_copy, name="geoip-seed", daemon=True).start()
 
 
+#: server era
+_SERVER_ERA: Optional[bool] = None
+
+
+def _uses_background_server(binary: str) -> bool:
+    """True when this opencode makes its model calls in a background server.
+
+    From 2.0.26 the TUI is only a client. The call itself is made by a
+    separate server process, and that process keeps the environment it was
+    STARTED with -- so a server born outside lingling carries no proxy, and
+    every model call leaves without a lane: the proof pane stays empty and
+    the exit the free tier counts is the user's own IP.
+
+    ``--standalone`` is not the answer. Its private server drops the
+    environment too, and it hides the shared server instead of fixing it.
+    The server itself has to be restarted under our environment, which is
+    exactly what the client/server CLI exposes.
+
+    ``--standalone`` is the marker for that era, so one help call answers
+    both "is there a server" and "does restarting it exist".
+    """
+    global _SERVER_ERA
+    if _SERVER_ERA is None:
+        try:
+            out = subprocess.run([binary, "--help"], capture_output=True,
+                                 text=True, timeout=15).stdout or ""
+            _SERVER_ERA = "--standalone" in out
+        except Exception:  # noqa: BLE001
+            _SERVER_ERA = False
+    return _SERVER_ERA
+
+
+def _server(binary: str, env: dict, action: str) -> None:
+    """Restart or stop the background server under our environment.
+
+    A running server keeps the environment it was born with, so the only
+    way a proxy reaches it is a restart -- and it must be restarted before
+    the TUI connects, not after. Stopping it on the way out matters just
+    as much: a server left holding a relay port that no longer exists
+    would break the next plain opencode on this machine.
+
+    The variables go into our own environment for the call rather than
+    through an explicit ``env=`` block. Windows does not hand a detached
+    server the proxy it was given that way -- measured, 0 calls proxied
+    against 12 for an inherited block -- and the server is detached here.
+    """
+    names = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+             "NO_PROXY", "no_proxy", "NODE_EXTRA_CA_CERTS")
+    saved = {name: os.environ.get(name) for name in names}
+    for name in names:
+        if env.get(name) is not None:
+            os.environ[name] = env[name]
+    try:
+        subprocess.run([binary, "service", action], capture_output=True,
+                       text=True, timeout=60)
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        for name, old in saved.items():
+            if old is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = old
+
+
 def _run_opencode(binary: str, args: list[str],
                   env: dict | None) -> int:
     """Exec opencode with stdio inherited so it owns the terminal."""
@@ -697,6 +762,10 @@ def _run_opencode(binary: str, args: list[str],
     """
     print(_c(" handoff: starting opencode -- its TUI loads quietly for a "
              "few seconds.", "90"), flush=True)
+    server = env is not None and _uses_background_server(binary)
+    if server:
+        # our relay
+        _server(binary, env, "restart")
     try:
         proc = subprocess.Popen([binary, *args], env=env)
     except OSError as exc:
@@ -712,6 +781,9 @@ def _run_opencode(binary: str, args: list[str],
         except Exception:  # noqa: BLE001
             pass
         return 130
+    finally:
+        if server:
+            _server(binary, env, "stop")
     if code != 0:
         print(_c(f" opencode exited (code {code}) -- the lanes stayed hot "
                  f"the whole time; run lingling again to ride.", "33"),
