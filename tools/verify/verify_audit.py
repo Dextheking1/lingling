@@ -633,6 +633,11 @@ def main():
                   # its own -- a credential that drifts per request makes
                   # Tor rebuild a circuit on every call
                   "verify_probe_circuit",
+                  # 2.0.26 opencode makes model calls in a background server
+                  # that keeps the env it was born with, so every request
+                  # left without a lane -- the server must be restarted under
+                  # our env, and stopped again on the way out
+                  "verify_server_proxy",
                   # pip cannot clean the data dir -- it only knows the 18
                   # files in site-packages -- so the uninstaller must,
                   # and must never touch the hand-written countries file
