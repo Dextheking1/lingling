@@ -19,6 +19,7 @@ one being upgraded.
 """
 
 import json
+import re
 import time
 from http.server import BaseHTTPRequestHandler
 
@@ -55,24 +56,92 @@ BROWSER_CACHE = "public, max-age=60"
 NOTICE = None
 MIN_SUPPORTED = None
 
+#: Versions we refuse to name, whatever the registry says.
+#:
+#: A published version name is permanent on PyPI: it cannot be reused and
+#: it cannot be unpublished without its own release being re-uploaded.
+#: Yanking is the standard retreat, but it hides a release from *new*
+#: resolutions only -- and the manifest, which is what every installed
+#: client actually reads, would go on announcing it. So the withdrawal
+#: has to be recorded here too, or the whole install base keeps being
+#: told to fetch something deliberately taken back.
+#:
+#: 2.1.20.post25 is withdrawn. Remove an
+#: entry only if that version is genuinely meant to be reachable again.
+RETIRED = {
+    "2.1.20.post25",
+}
 
-def newest_on_pypi():
-    """The published version, or None. Never raises."""
+
+def _key(version):
+    """Ordering key for lingling's scheme: ``X.Y.Z[.postN]``.
+
+    PEP 440 puts a post release after the release it amends, so
+    ``2.1.20.post25`` sorts above ``2.1.20`` and below ``2.1.21``.
+    """
+    text = (version or "").strip().lstrip("vV").split("+", 1)[0].strip()
+    post = 0
+    if ".post" in text:
+        text, _, tail = text.partition(".post")
+        digits = re.sub(r"\D", "", tail)
+        post = int(digits) if digits else 1
+    parts = []
+    for chunk in text.split("."):
+        digits = re.sub(r"\D", "", chunk)
+        parts.append(int(digits) if digits else 0)
+    parts += [0] * (3 - len(parts))
+    return (parts[0], parts[1], parts[2], 1 if post else 0, post)
+
+
+def newest_installable():
+    """The version pip would actually pick, or None. Never raises.
+
+    Deliberately not ``info.version``. That field names the newest
+    *release*, and a release whose every file has been yanked is one pip
+    will refuse to install -- so a manifest that repeated it would send
+    the whole install base chasing a version that cannot be fetched, and
+    keep sending them after the version was withdrawn. Measured: with
+    post25 yanked, ``info.version`` still said post25 while a fresh
+    ``pip download`` resolved post24.
+
+    Scanning the release list for the newest version with at least one
+    live file is the same rule pip applies, which is the only definition
+    of "newest" this endpoint should ever publish.
+    """
     try:
         import urllib.request
         request = urllib.request.Request(
             PYPI_URL, headers={"User-Agent": "lingling-update-api"})
         with urllib.request.urlopen(request, timeout=PYPI_TIMEOUT) as response:
-            return (json.load(response).get("info") or {}).get("version")
+            doc = json.load(response)
     except Exception:
         return None
+
+    best = None
+    for version, files in (doc.get("releases") or {}).items():
+        if not files:
+            continue
+        if version in RETIRED:
+            continue
+        if all(f.get("yanked") for f in files):
+            continue
+        if best is None or _key(version) > _key(best):
+            best = version
+    if best is None:
+        # A registry that answered with nothing usable still has the one
+        # field this function exists to report, unless that version is
+        # one we have withdrawn -- in which case saying nothing is the
+        # honest answer.
+        fallback = (doc.get("info") or {}).get("version")
+        return None if fallback in RETIRED else fallback
+    return best
 
 
 def manifest():
     return {
         "schema": SCHEMA,
         "package": "lingling",
-        "latest": newest_on_pypi(),
+        "latest": newest_installable(),
         "min_supported": MIN_SUPPORTED,
         "notice": NOTICE,
         "url": PROJECT_URL,
