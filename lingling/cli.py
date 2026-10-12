@@ -17,6 +17,7 @@ from .health import HealthDaemon
 from .lanes import TorManager
 from .relay import Relay
 from . import netutil
+from . import update
 
 
 def _other_lingling() -> int:
@@ -463,9 +464,24 @@ def _uninstall(rest: list[str]) -> int:
     return 0
 
 
+def _say_update(check_obj) -> None:
+    """The update notice, and the one install it may schedule.
+
+    Both are held until the terminal is handed over: the spinner owns
+    the line until then, and a notice printed under a live spinner is
+    erased by its next repaint. At most one install is scheduled per
+    session, and never while a lane is hot.
+    """
+    update.emit(check_obj)
+    if check_obj is not None:
+        update.auto_install(DATA_DIR, check_obj.info)
+
+
 def main(argv: list[str]) -> int:
     if argv and argv[0] in ("uninstall", "--uninstall"):
         return _uninstall(argv[1:])
+    if argv and argv[0] in ("update", "--update"):
+        return update.update_command(argv[1:])
     opts = _parse_args(argv)
 
     if opts["proof_tail"] is not None:
@@ -481,6 +497,8 @@ def main(argv: list[str]) -> int:
 
     if "--version" in opts["passthrough"] or "-v" in opts["passthrough"]:
         print(f"lingling {__version__} (wraps opencode)")
+        # From cache only: asking the version must not cost a request.
+        update.cached_hint(DATA_DIR)
         return 0
 
     opencode = shutil.which("opencode")
@@ -509,6 +527,13 @@ def main(argv: list[str]) -> int:
 
     _migrate_countries()
     _spawn_geoip_fallback()
+    """
+    The update check rides the boot rather than preceding it: this call
+    only starts a thread, and the answer is collected at the handoff
+    seconds or minutes later. A dead endpoint therefore costs a launch
+    nothing, and an offline machine still cannot tell it ran.
+    """
+    update_check = update.start(DATA_DIR)
     """
     Two lines, that is the whole message list. Pinned before the spinner
     ticks and never replaced until the lane serves: tor refreshing its
@@ -580,6 +605,7 @@ def main(argv: list[str]) -> int:
             loader.stop()
             print(_c("lingling: no lanes -- opencode rides your own IP.\n",
                      "33"))
+            _say_update(update_check)
             code = _run_opencode(opencode, opts["passthrough"], None)
             end_code.append(code)
             return code
@@ -606,6 +632,7 @@ def main(argv: list[str]) -> int:
 
         loader.stop(_c(" served! lanes are hot -- proof is in the other "
                        "window.", "1;32"))
+        _say_update(update_check)
         if not opts["no_proof"]:
             proof.spawn_proof_window(PROOF_LOG)
 
