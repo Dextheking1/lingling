@@ -7,6 +7,13 @@ import os
 from ctypes import wintypes
 
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+#: Without this, Windows *rejects* CREATE_BREAKAWAY_FROM_JOB outright, and
+#: every child of a job member is dragged into the job whether it asks or
+#: not -- including the updater's helper, which is killed on close at the
+#: exact moment it is meant to run pip. Permitting breakaway only helps a
+#: process that explicitly requests it; tor.exe never does, so lanes still
+#: die with us.
+_JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _PROCESS_SET_QUOTA = 0x0100
 _PROCESS_TERMINATE = 0x0001
@@ -97,7 +104,8 @@ def ensure_kill_job() -> bool:
     if not job:
         return False
     info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    info.BasicLimitInformation.LimitFlags = (
+        _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | _JOB_OBJECT_LIMIT_BREAKAWAY_OK)
     ok = k.SetInformationJobObject(
         job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
         ctypes.byref(info), ctypes.sizeof(info),

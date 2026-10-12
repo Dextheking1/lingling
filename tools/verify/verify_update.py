@@ -570,6 +570,67 @@ def section_command(url):
           "install by hand" in out, out[:250])
 
 
+def section_job():
+    """The bug that made the whole feature useless in the field.
+
+    A real launch joins a KILL_ON_JOB_CLOSE job (lanes.py, on its first
+    lane), and Windows pulls every child of a job member into that job
+    whether the child asks or not. So the detached installer was killed
+    at the instant lingling exited -- exactly when it was supposed to run
+    -- while the log still said it had been scheduled. Every test above
+    passed throughout, because none of them created a job.
+
+    The control is the point: an ordinary child must die. Without it this
+    test would also pass on a machine where the job was never created.
+    """
+    print("\n=== 17. the installer escapes the Windows kill job ===")
+    if os.name != "nt":
+        print("  (not Windows -- no job object to escape)")
+        return
+    data = scratch()
+    escaped = data / "escaped.txt"
+    killed = data / "killed.txt"
+    quick = data / "mark.py"
+    slow = data / "slow.py"
+    quick.write_text("import pathlib, sys\n"
+                     "pathlib.Path(sys.argv[1]).write_text('ran')\n",
+                     encoding="utf-8")
+    slow.write_text("import pathlib, sys, time\n"
+                    "time.sleep(6)\n"
+                    "pathlib.Path(sys.argv[1]).write_text('ran')\n",
+                    encoding="utf-8")
+    # The child joins the kill job, starts a plain child that will still be
+    # asleep when the job closes, schedules the real helper, then exits.
+    child = (
+        "import subprocess, sys\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        "from lingling import winjob, update\n"
+        "print('job joined:', winjob.ensure_kill_job(), flush=True)\n"
+        "subprocess.Popen([sys.executable, sys.argv[3], sys.argv[2]])\n"
+        "print('helper pid:', update.spawn_deferred(sys.argv[1]), flush=True)\n"
+    )
+    env = env_for("", {"LINGLING_UPDATE_CMD":
+                       f'"{sys.executable}" "{quick}" "{escaped}"'})
+    res = subprocess.run(
+        [sys.executable, "-c", child, str(data), str(killed), str(slow)],
+        cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=180)
+    print("   " + " | ".join(res.stdout.strip().splitlines())[:150])
+    deadline = time.time() + 40
+    while time.time() < deadline and not escaped.exists():
+        time.sleep(0.25)
+    check("the detached installer outlives the job that owns us",
+          escaped.exists(),
+          "the job killed it -- so no session would ever install an update")
+    # Give the control longer than its 6s sleep, so absence is meaningful.
+    waited = time.time() + 9
+    while time.time() < waited:
+        time.sleep(0.5)
+    check("and an ordinary child of the same job really does die",
+          not killed.exists(),
+          "the control survived, so the kill job was not in force and the "
+          "check above proves nothing")
+
+
 def section_wiring(url):
     print("\n=== 15. the launch path, by source ===")
     src = (ROOT / "lingling" / "cli.py").read_text(encoding="utf-8")
@@ -616,6 +677,7 @@ def main() -> int:
     section_deferral()
     section_command(url)
     section_wiring(url)
+    section_job()
 
     print()
     cleanup()

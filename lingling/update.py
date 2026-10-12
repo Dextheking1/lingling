@@ -653,9 +653,30 @@ def installed_version() -> Optional[str]:
         return None
 
 
-def _detach_kwargs() -> dict:
+#: CreateProcess flags for the detached installer.
+#:
+#: DETACHED_PROCESS gives it no console, CREATE_NEW_PROCESS_GROUP keeps a
+#: Ctrl+C in the session from reaching it, and CREATE_BREAKAWAY_FROM_JOB is
+#: the one that actually matters. lingling joins a KILL_ON_JOB_CLOSE job as
+#: soon as its first lane starts (``winjob.ensure_kill_job``), and Windows
+#: drags every child of a job member into that job whether the child asks or
+#: not -- so without breakaway the helper is terminated at the instant
+#: lingling exits, which is exactly when it is supposed to run pip. The
+#: install then silently never happens, while the log still cheerfully says
+#: it was scheduled. Breakaway requires the job to permit it, which is why
+#: ``winjob`` sets JOB_OBJECT_LIMIT_BREAKAWAY_OK; a third-party job that
+#: forbids it rejects this spawn outright, and the retry below covers that.
+_DETACHED = 0x00000008
+_NEW_GROUP = 0x00000200
+_BREAKAWAY = 0x01000000
+
+
+def _detach_kwargs(breakaway: bool = True) -> dict:
     if os.name == "nt":
-        return {"creationflags": 0x00000008 | 0x00000200}  # DETACHED | NEW_GROUP
+        flags = _DETACHED | _NEW_GROUP
+        if breakaway:
+            flags |= _BREAKAWAY
+        return {"creationflags": flags}
     return {"start_new_session": True}
 
 
@@ -666,6 +687,10 @@ def spawn_deferred(data_dir, delay: Optional[float] = None):
     is the default path precisely because of the lock described in
     :func:`_running_launcher`: the one file an upgrade must replace is
     the one file that cannot be replaced while lingling runs.
+
+    The helper must also outlive our process *group*, not just our pid:
+    it breaks away from the kill job (see :data:`_BREAKAWAY`), without
+    which the job terminates it on close and the install never runs.
     """
     argv = upgrade_command()
     if not argv:
@@ -676,14 +701,20 @@ def spawn_deferred(data_dir, delay: Optional[float] = None):
         log = open(log_path, "a", encoding="utf-8")
     except OSError:
         return None
-    try:
-        env = dict(os.environ)
-        env["LINGLING_HELPER_WAIT"] = str(delay or HELPER_WAIT)
-        proc = subprocess.Popen(
-            [sys.executable or "python", "-c", _HELPER, str(os.getpid()), *argv],
-            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-            close_fds=True, env=env, **_detach_kwargs())
-    except Exception:  # noqa: BLE001
+    env = dict(os.environ)
+    env["LINGLING_HELPER_WAIT"] = str(delay or HELPER_WAIT)
+    cmd = [sys.executable or "python", "-c", _HELPER, str(os.getpid()), *argv]
+    proc = None
+    for breakaway in (True, False):
+        try:
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=log,
+                stderr=subprocess.STDOUT, close_fds=True, env=env,
+                **_detach_kwargs(breakaway))
+            break
+        except Exception:  # noqa: BLE001 -- a job may forbid breakaway
+            proc = None
+    if proc is None:
         try:
             log.close()
         except Exception:  # noqa: BLE001
