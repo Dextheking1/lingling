@@ -379,13 +379,18 @@ def behind(info: Optional[dict], current: Optional[str] = None) -> bool:
 
 
 def notice_lines(info: Optional[dict], current: Optional[str] = None,
-                 mode_name: Optional[str] = None) -> list:
+                 mode_name: Optional[str] = None, ask: bool = False) -> list:
     """The lines worth printing, or an empty list to stay silent.
 
     Silence is the default in every direction: up to date, unreachable,
     unparseable, or switched off. The one case that is never silent is
     a build below the manifest's floor -- that is lingling saying the
     current opencode will not work with what you have.
+
+    ``ask`` drops the one claim that a question would contradict: when
+    the install is about to be offered, the notice names the versions
+    and stops, because whether it lands is the user's answer and not a
+    sentence this line gets to promise.
     """
     if mode_name == "off" or not behind(info, current):
         return []
@@ -401,7 +406,9 @@ def notice_lines(info: Optional[dict], current: Optional[str] = None,
             f"  you are on {current}, and this opencode needs {floor} or "
             f"newer -- update before the next session")
     elif is_newer(latest, current):
-        if mode_name == "auto":
+        if mode_name == "auto" and ask:
+            lines.append(f"  lingling {latest} is out (you are on {current}).")
+        elif mode_name == "auto":
             lines.append(
                 f"  lingling {latest} is out (you are on {current}) -- it "
                 f"installs when this session ends")
@@ -473,7 +480,16 @@ def start(data_dir) -> Optional[Check]:
         return None
 
 
-def emit(check_obj: Optional[Check], stream=None) -> None:
+def _say(stream, line: str) -> None:
+    """Best effort: a closed or broken stream must not kill a launch."""
+    try:
+        stream.write(line + "\n")
+        stream.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def emit(check_obj: Optional[Check], stream=None, ask: bool = False) -> None:
     """Say the one thing there is to say, or nothing at all.
 
     stderr, because a notice is not this program's output: a script
@@ -482,29 +498,15 @@ def emit(check_obj: Optional[Check], stream=None) -> None:
     if check_obj is None:
         return
     stream = stream or sys.stderr
-    lines = notice_lines(check_obj.info, mode_name=mode())
-    if not lines:
-        return
-    try:
-        for line in lines:
-            stream.write(line + "\n")
-        stream.flush()
-    except Exception:  # noqa: BLE001 -- a closed stderr must not kill a lane
-        pass
+    for line in notice_lines(check_obj.info, mode_name=mode(), ask=ask):
+        _say(stream, line)
 
 
 def cached_hint(data_dir, stream=None) -> None:
     """The ``--version`` line, from cache only. Never touches the net."""
     stream = stream or sys.stderr
-    lines = notice_lines(read_cache(data_dir), mode_name=mode())
-    if not lines:
-        return
-    try:
-        for line in lines:
-            stream.write(line + "\n")
-        stream.flush()
-    except Exception:  # noqa: BLE001
-        pass
+    for line in notice_lines(read_cache(data_dir), mode_name=mode()):
+        _say(stream, line)
 
 
 # ---------------------------------------------------------------------------
