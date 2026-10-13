@@ -686,6 +686,33 @@ def installed_version() -> Optional[str]:
         return None
 
 
+def helper_python() -> str:
+    """The interpreter the detached helper itself should run.
+
+    ``sys.executable`` is not always it. Under pipx -- and any venv --
+    ``Scripts/python.exe`` is a redirector stub: a small console program
+    that starts the real interpreter as its OWN child, and a console
+    child of a console-less parent is handed a brand new console.
+    Measured here, the same detached sleep: through the venv stub it
+    opened a visible terminal window, through the base interpreter it
+    opened none. The stub is the process that receives DETACHED_PROCESS,
+    so the flag is spent on the one process that cannot flash while its
+    child -- the one that polls for the whole session -- gets a window.
+    That is the field report this module already fixed once, back again
+    for every pipx user.
+
+    ``_base_executable`` is that real interpreter, and the helper needs
+    nothing but the standard library, so nothing else moves: the
+    installer argv was built in *this* process and still names
+    ``sys.executable``, which is how the install lands in the venv that
+    owns lingling instead of somewhere else.
+    """
+    base = getattr(sys, "_base_executable", "") or ""
+    if base and base != sys.executable and os.path.isfile(base):
+        return base
+    return sys.executable or "python"
+
+
 #: CreateProcess flags for the detached installer.
 #:
 #: DETACHED_PROCESS gives it no console, CREATE_NEW_PROCESS_GROUP keeps a
@@ -736,7 +763,7 @@ def spawn_deferred(data_dir, delay: Optional[float] = None):
         return None
     env = dict(os.environ)
     env["LINGLING_HELPER_WAIT"] = str(delay or HELPER_WAIT)
-    cmd = [sys.executable or "python", "-c", _HELPER, str(os.getpid()), *argv]
+    cmd = [helper_python(), "-c", _HELPER, str(os.getpid()), *argv]
     proc = None
     for breakaway in (True, False):
         try:
