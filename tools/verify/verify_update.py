@@ -15,6 +15,12 @@ process to exit. The test for that is the two-sided one in section 8: no
 install while a process is alive, install once it is gone. Both halves
 have to hold, or the fix is worse than the bug.
 
+The install is offered, not sprung. With a terminal on both ends the
+handoff asks, and the notice stops promising; with a redirected stream, a
+shortcut or a service it does not ask, and the silent install those
+machines need still runs. Sections 19-24 pin every branch of that, down
+to a real launch that must come back on its own with a closed stdin.
+
 Everything is local: a throwaway data dir via LINGLING_DATA_DIR, a manifest
 served from a thread on 127.0.0.1, and the registry redirected at it too --
 except in section 9, where a real PyPI answer is the point.
@@ -432,10 +438,14 @@ def section_deferral():
     data = scratch()
     marker = data / "installed.txt"
     script = data / "marker.py"
-    # Writes its own argv, so the assertion can see *which* installer ran.
+    # Writes its own argv, and speaks on both streams, so the assertion
+    # can see *which* installer ran and whether its output survived.
     script.write_text(
         "import pathlib, sys\n"
-        "pathlib.Path(sys.argv[1]).write_text(' '.join(sys.argv))\n",
+        "print('installer stdout line')\n"
+        "print('installer stderr line', file=sys.stderr)\n"
+        "pathlib.Path(sys.argv[1]).write_text(' '.join(sys.argv))\n"
+        "raise SystemExit(7)\n",
         encoding="utf-8")
 
     # The child stands in for a live session: it schedules the install and
@@ -476,12 +486,27 @@ def section_deferral():
         if proc.poll() is None:
             proc.kill()
 
-    text = (data / "update.log").read_text(encoding="utf-8",
-                                           errors="replace") \
-        if (data / "update.log").exists() else ""
+    log = data / "update.log"
+    # The exit line lands a beat after the marker: the installer writes the
+    # marker, exits, and only then does the helper report the code. Wait for
+    # it, so a slow machine is not a false failure.
+    deadline = time.time() + 30
+    text = ""
+    while time.time() < deadline:
+        text = log.read_text(encoding="utf-8", errors="replace") \
+            if log.exists() else ""
+        if "install exit:" in text:
+            break
+        time.sleep(0.25)
+    lines = [ln.strip() for ln in text.splitlines()]
     check("the log says who scheduled it",
           "scheduled by lingling" in text, text[:200])
     check("and what it ran", "running:" in text, text[:200])
+    check("the installer's own output reaches the log",
+          "installer stdout line" in lines
+          and "installer stderr line" in lines, text[-300:])
+    check("and the exit code, so a failed install cannot pass as quiet",
+          "install exit: 7" in lines, text[-300:])
     if marker.exists():
         check("the configured installer is what ran",
               "marker.py" in marker.read_text(encoding="utf-8"),
@@ -667,6 +692,492 @@ def section_wiring(url):
     check("and made no request at all", not HITS, str(HITS))
 
 
+def _visible_console_windows() -> int:
+    """How many VISIBLE console windows this desktop has right now."""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    n = [0]
+    cb_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p,
+                                 ctypes.c_void_p)
+
+    def cb(hwnd, _lparam):
+        if user32.IsWindowVisible(hwnd):
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, buf, 256)
+            if "Console" in buf.value:
+                n[0] += 1
+        return True
+
+    user32.EnumWindows(cb_type(cb), None)
+    return n[0]
+
+
+class _WindowWatcher(threading.Thread):
+    """Peak count of visible console windows while this runs."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.baseline = _visible_console_windows()
+        self.peak = self.baseline
+        self._halt = False          # not _stop: Thread._stop() is a method
+
+    def run(self):
+        while not self._halt:
+            self.peak = max(self.peak, _visible_console_windows())
+            time.sleep(0.02)
+
+    def finish(self):
+        self._halt = True
+        self.join()
+
+
+#: DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP -- how the helper is spawned,
+#: so it has no console of its own. That is the whole cause of the bug below.
+_DETACHED = 0x00000008 | 0x00000200
+
+
+#: CREATE_NO_WINDOW. Unflagged is the control, and it must flash.
+_NO_FLAGS = 0
+
+
+def _shake(data, flags, env):
+    """Run one of the two spawners detached; return the window peak."""
+    w = _WindowWatcher()
+    w.start()
+    proc = subprocess.Popen([sys.executable, *data], creationflags=_DETACHED,
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, env=env)
+    proc.wait(timeout=180)
+    time.sleep(0.3)
+    w.finish()
+    return w
+
+
+def section_nowindow():
+    """The helper must not flash a terminal twice a second.
+
+    The helper runs DETACHED_PROCESS, so it has no console, and Windows
+    hands a console-mode child of a console-less parent a BRAND NEW console
+    -- a visible one. Its liveness poll called tasklist every half a second
+    for as long as lingling ran, so the field report of "terminals spamming
+    when the timer finished" was this loop, not the proof pane: it starts at
+    the handoff because that is where the helper is spawned, and it stops
+    when the helper does.
+
+    Run, not inspected: the shipped helper source, detached, watching this
+    live process so it keeps polling. The control spawns the same tasklist
+    WITHOUT the flag and must produce a window -- otherwise the sampler is
+    blind and the check above proves nothing at all.
+    """
+    print("\n=== 18. the installer helper cannot flash a console window ===")
+    if os.name != "nt":
+        print("  (not Windows -- no console allocation to suppress)")
+        return
+    data = scratch()
+    helper = data / "helper.py"
+    helper.write_text(update._HELPER, encoding="utf-8")
+    env = dict(os.environ, LINGLING_HELPER_WAIT="6")
+
+    w = _shake([str(helper), str(os.getpid())], _NO_FLAGS, env)
+    print(f"   helper polled for 6s: baseline={w.baseline} peak={w.peak}")
+    check("polling for a live lingling opens no window",
+          w.peak == w.baseline,
+          f"peaked at {w.peak} visible console windows from {w.baseline} -- "
+          "a terminal flashing for the whole session")
+
+    # And the installer it hands off to must stay hidden too: explicit
+    # stdout/stderr streams do not change console allocation, but the flag
+    # that does is one refactor away from being dropped.
+    touched = data / "installer-ran.txt"
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    run = _shake([str(helper), str(dead.pid), sys.executable, "-c",
+                  f"import pathlib, time; "
+                  f"pathlib.Path({str(touched)!r}).write_text('ran'); "
+                  f"time.sleep(2)"], _NO_FLAGS, env)
+    print(f"   helper installing for ~2s: baseline={run.baseline} "
+          f"peak={run.peak}")
+    check("the watcher saw the installer run", touched.exists(),
+          "the stand-in installer never wrote its file")
+    check("and running the installer opens no window either",
+          run.peak == run.baseline,
+          f"peaked at {run.peak} visible console windows from {run.baseline}")
+
+    burst = data / "burst.py"
+    burst.write_text(
+        "import subprocess\n"
+        "argv = ['tasklist', '/FI', 'PID eq 0', '/NH']\n"
+        "for _ in range(20):\n"
+        "    subprocess.Popen(argv, stdin=subprocess.DEVNULL,\n"
+        "                     stdout=subprocess.DEVNULL,\n"
+        "                     stderr=subprocess.DEVNULL).wait()\n",
+        encoding="utf-8")
+    ctl = _shake([str(burst)], _NO_FLAGS, env)
+    check("control: the same poll without the flag DOES open one",
+          ctl.peak > ctl.baseline,
+          "the sampler saw nothing even without the flag, so the check "
+          "above proves nothing")
+
+
+def section_question():
+    """Who gets asked, and -- the point -- who does not.
+
+    The install used to be silent and automatic, which is exactly what
+    an unattended machine needs. The question is for the person who is
+    watching, and every path where nobody is watching has to fall back
+    to that old behaviour rather than to a hang.
+    """
+    print("\n=== 19. an update is offered, and only to someone who can answer ===")
+    newer = {"latest": "9.9.9", "min_supported": None, "notice": None}
+    current = {"latest": CURRENT, "min_supported": None, "notice": None}
+
+    with env_swap(LINGLING_UPDATE="auto"), \
+            patched(_at_terminal=lambda: True, _pending_input=lambda: False):
+        check("a terminal with an update waiting is asked", update.askable(newer))
+        check("a terminal with nothing to install is not",
+              not update.askable(current) and not update.askable(None),
+              "silence in every direction that is not an update")
+    with env_swap(LINGLING_UPDATE="auto"), \
+            patched(_at_terminal=lambda: False, _pending_input=lambda: False):
+        check("a launch nobody can be asked is not asked",
+              not update.askable(newer),
+              "a redirected launch must fall back to the silent install")
+    with env_swap(LINGLING_UPDATE="auto"), \
+            patched(_at_terminal=lambda: True, _pending_input=lambda: True):
+        check("a line already typed ahead is never eaten by the question",
+              not update.askable(newer),
+              "reading it would hand opencode an empty first prompt")
+    for mode_name in ("notify", "off"):
+        with env_swap(LINGLING_UPDATE=mode_name), \
+                patched(_at_terminal=lambda: True,
+                        _pending_input=lambda: False):
+            check(f"{mode_name} mode is never asked",
+                  not update.askable(newer))
+
+    class _Tty:
+        """An isatty that says yes: the shape the console guard exists for."""
+
+        def isatty(self):
+            return True
+
+    class _NotTty:
+        def isatty(self):
+            return False
+
+    check("a redirected output is never asked",
+          not update._at_terminal(_NotTty()))
+    if os.name == "nt":
+        check("a Windows terminal must have a real console behind it",
+              update._at_terminal(_Tty()) == update._console_stdin(),
+              f"at_terminal={update._at_terminal(_Tty())} "
+              f"console={update._console_stdin()} -- isatty alone asks a "
+              f"launch that can only answer with EOF, and the EOF is a no")
+    else:
+        check("a POSIX terminal is the one the OS calls a tty",
+              update._at_terminal(_Tty()) == sys.stdin.isatty())
+    src = (ROOT / "lingling" / "update.py").read_text(encoding="utf-8")
+    guard = src.split("def _console_stdin", 1)[1].split("\ndef ", 1)[0]
+    terminal = src.split("def _at_terminal", 1)[1].split("\ndef ", 1)[0]
+    check("the Windows answer is the OS's own console check",
+          "GetConsoleMode" in guard and "-10" in guard, guard[:160])
+    check("and that is what the terminal test consults on Windows",
+          "_console_stdin()" in terminal, terminal[:160])
+
+
+def section_answers():
+    """What each answer does, at the one place that schedules an install."""
+    print("\n=== 20. Enter installs, n skips, and nothing else drops it ===")
+    data = scratch()
+    newer = {"latest": "9.9.9", "min_supported": None, "notice": None}
+
+    def answer(text):
+        """Drive one answer through the real scheduler, faking the read."""
+        stream = io.StringIO()
+        prompts = []
+
+        def read(prompt, out):
+            prompts.append(prompt)
+            return text
+
+        with patched(spawn_deferred=lambda dd, delay=None: 4242), \
+                env_swap(LINGLING_UPDATE="auto"):
+            pid = update.auto_install(data, newer, ask=True, read=read,
+                                      stream=stream)
+        return pid, prompts, stream.getvalue()
+
+    pid, prompts, out = answer("")
+    check("a bare Enter installs it", pid == 4242, f"pid={pid}")
+    check("the question says which answer is the default",
+          prompts == [update.PROMPT] and "[Y/n]" in prompts[0], str(prompts))
+    check("and Enter declares nothing skipped", "skipped" not in out, out)
+
+    for yes in ("y", "Y", "yes", "YES"):
+        pid, _, out = answer(yes)
+        check(f"`{yes}` installs it", pid == 4242, f"pid={pid}")
+
+    for no in ("n", "N", "no", "  NO  "):
+        pid, _, out = answer(no)
+        check(f"`{no}` does not", pid is None, f"pid={pid}")
+        check(f"and `{no}` says how to get it later",
+              "lingling update" in out and "notify" in out, out)
+
+    pid, _, out = answer("what?")
+    check("an answer that is neither still installs, it never drops one quietly",
+          pid == 4242 and "skipped" not in out, f"pid={pid} out={out!r}")
+
+    asked = []
+
+    def never(prompt, out):
+        asked.append(prompt)
+        return "n"
+
+    with patched(spawn_deferred=lambda dd, delay=None: 4242), \
+            env_swap(LINGLING_UPDATE="notify"):
+        pid = update.auto_install(data, newer, ask=True, read=never,
+                                  stream=io.StringIO())
+    check("an offer in notify mode is never even read",
+          pid is None and not asked, f"pid={pid} asked={asked}")
+    with patched(spawn_deferred=lambda dd, delay=None: 4242), \
+            env_swap(LINGLING_UPDATE="auto"):
+        pid = update.auto_install(data, {"latest": CURRENT}, ask=True,
+                                  read=never, stream=io.StringIO())
+    check("and an up-to-date build is not asked either",
+          pid is None and not asked, f"pid={pid} asked={asked}")
+
+
+def section_read():
+    """The read itself: prompt first, and every interruption is a no."""
+    print("\n=== 21. the read: the question is written before anything waits ===")
+    import builtins
+    real_input = builtins.input
+    try:
+        for exc in (EOFError, KeyboardInterrupt):
+            stream = io.StringIO()
+
+            def raised(_exc=exc):
+                raise _exc()
+
+            builtins.input = raised
+            got = update._ask("  q? [Y/n] ", stream)
+            check(f"{exc.__name__} reads as no", got == "n", repr(got))
+            check(f"and {exc.__name__} closes the line instead of gluing the "
+                  f"next output to the question",
+                  stream.getvalue() == "  q? [Y/n] \n", repr(stream.getvalue()))
+
+        stream = io.StringIO()
+        builtins.input = lambda: "y"
+        check("an answered question still returns the answer",
+              update._ask("  q? ", stream) == "y")
+        check("and the prompt was written before the read, not after",
+              stream.getvalue() == "  q? ", repr(stream.getvalue()))
+    finally:
+        builtins.input = real_input
+
+
+def section_notice_ask():
+    """The notice and the question must not contradict each other."""
+    print("\n=== 22. the notice stops promising when it is about to ask ===")
+    newer = {"latest": "9.9.9", "min_supported": None, "notice": None}
+    asked = update.notice_lines(newer, CURRENT, "auto", ask=True)
+    check("asked: it names the versions and stops",
+          len(asked) == 1 and "9.9.9" in asked[0] and CURRENT in asked[0]
+          and "installs when this session ends" not in asked[0], str(asked))
+    plain = update.notice_lines(newer, CURRENT, "auto")
+    check("unasked: it still says the install lands after the session",
+          "installs when this session ends" in plain[0], str(plain))
+    check("notify mode is untouched by the question",
+          "lingling update" in update.notice_lines(newer, CURRENT, "notify")[0])
+
+    class _Done:
+        """A finished check: the handoff reads exactly one attribute."""
+
+        info = newer
+
+    stream = io.StringIO()
+    with env_swap(LINGLING_UPDATE="auto"):
+        update.emit(_Done(), stream=stream, ask=True)
+        emitted = stream.getvalue()
+    check("emit carries the decision into the notice",
+          "9.9.9" in emitted
+          and "installs when this session ends" not in emitted, emitted)
+
+
+def section_handoff():
+    """The CLI's own handoff function, driven through both branches.
+
+    Section 22 proves the wording; this proves the wiring -- that the
+    one decision reaches both the notice and the question, and that a
+    launch which cannot be asked still schedules the install instead of
+    waiting for an answer that never comes.
+    """
+    print("\n=== 23. the handoff: one decision, one notice, one question ===")
+    from lingling import cli
+
+    class _Check:
+        def __init__(self, info):
+            self.info = info
+
+    newer = {"latest": "9.9.9", "min_supported": None, "notice": None}
+
+    def handoff(can_ask, answer):
+        asked, spawned, err = [], [], io.StringIO()
+
+        def read(prompt, stream):
+            asked.append(prompt)
+            return answer
+
+        with patched(askable=lambda info=None: can_ask,
+                     spawn_deferred=lambda dd, delay=None: (
+                         spawned.append(dd) or 4242),
+                     _ask=read), \
+                env_swap(LINGLING_UPDATE="auto"), \
+                contextlib.redirect_stderr(err):
+            cli._say_update(_Check(newer))
+        return err.getvalue(), asked, spawned
+
+    out, asked, spawned = handoff(True, "n")
+    check("a person at the terminal is told, then asked",
+          "9.9.9" in out and asked == [update.PROMPT], f"{out!r} {asked!r}")
+    check("and the notice does not claim the install it is offering",
+          "installs when this session ends" not in out, out)
+    check("a no at the handoff schedules nothing", not spawned, str(spawned))
+
+    out, _, spawned = handoff(True, "")
+    check("Enter at the handoff schedules the deferred install",
+          len(spawned) == 1, str(spawned))
+
+    out, asked, spawned = handoff(False, "n")
+    check("a launch that cannot be asked is not asked, and still installs",
+          not asked and len(spawned) == 1, f"{asked} {spawned}")
+    check("and that notice keeps saying the install lands after the session",
+          "installs when this session ends" in out, out)
+
+    src = (ROOT / "lingling" / "cli.py").read_text(encoding="utf-8")
+    body = src.split("def _say_update", 1)[1].split("\ndef ", 1)[0]
+    check("the decision is computed once and handed to both calls",
+          body.count("update.askable(") == 1 and body.count("ask=ask") == 2,
+          body[:200])
+    check("and the question lives in the engine, not the launcher",
+          "input(" not in body, body[:200])
+
+
+def section_launch(url):
+    """A real launch with a redirected stdin: no question, no hang.
+
+    The one regression this feature could introduce is a launch that
+    blocks on a question whose answer nobody can see -- a service, a
+    shortcut, `lingling | tee log`. So this runs the real entry point
+    with stdin closed and an update waiting, and requires it to return
+    on its own. Whether the install was *scheduled* is deliberately not
+    asserted: the check rides the boot, and this fake boot is over in
+    milliseconds, so a notice that never got to speak is the documented
+    behaviour rather than a failure.
+    """
+    print("\n=== 24. a launch nobody can be asked never waits on an answer ===")
+    data = scratch()
+    PAYLOAD["manifest"] = manifest(latest="9.9.9")
+    ran = data / "installer-ran.txt"
+    installer = data / "installer.py"
+    installer.write_text("import pathlib, sys\n"
+                         "pathlib.Path(sys.argv[1]).write_text('ran')\n",
+                         encoding="utf-8")
+    # A console program for `shutil.which` to find. The interpreter makes
+    # a faithful stand-in: it starts, sees a closed stdin, and exits 0.
+    bindir = data / "bin"
+    bindir.mkdir()
+    shutil.copyfile(sys.executable, bindir / "opencode.exe")
+
+    env = env_for(url, {
+        "LINGLING_UPDATE_CMD": f'"{sys.executable}" "{installer}" "{ran}"',
+        "LINGLING_NO_MITM": "1",
+        # env_for() deliberately drops this, and a launch reads the cache
+        # of whatever data dir it is given: without it the fake 9.9.9 in
+        # this manifest would be written into the user's own lingling-data
+        # and every real check for the next six hours would repeat it.
+        "LINGLING_DATA_DIR": str(data),
+    })
+    key = next((k for k in env if k.upper() == "PATH"), "PATH")
+    env[key] = str(bindir) + os.pathsep + env.get(key, "")
+
+    try:
+        res = subprocess.run(
+            [sys.executable, "-m", "lingling", "--no-tor", "--no-proof"],
+            cwd=str(ROOT), env=env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        check("the launch came back on its own", False,
+              "it is still running after 180s -- something is waiting on input")
+        return
+    out = res.stdout + res.stderr
+    check("the launch came back on its own", res.returncode == 0,
+          f"exit {res.returncode}: {out[-300:]}")
+    check("it rode the direct path it was pointed at", "no lanes" in out,
+          out[:200])
+    check("it never wrote a question to a redirected launch", "[Y/n]" not in out,
+          out[-200:])
+    check("and it handed the terminal to opencode all the same",
+          "handoff: starting opencode" in out, out[-200:])
+
+
+def section_helper_python():
+    """The helper must not be launched through a venv redirector stub.
+
+    pipx is a venv, and ``Scripts/python.exe`` there is a stub that
+    starts the real interpreter as its own child -- and the child is the
+    process that polls for the whole session, the one Windows hands a
+    fresh console. So the helper is pointed at the base interpreter,
+    while the installer argv keeps the interpreter lingling itself runs
+    on, which is what makes pip install into the right place.
+    """
+    print("\n=== 25. the helper runs on an interpreter that cannot flash ===")
+    got = update.helper_python()
+    check("the helper interpreter is a real file", pathlib.Path(got).is_file(),
+          got)
+    check("and this install needs no redirecting",
+          got in (sys.executable, getattr(sys, "_base_executable", None)), got)
+
+    decoy = scratch() / "python-decoy.exe"
+    shutil.copyfile(sys.executable, decoy)
+    had = getattr(sys, "_base_executable", None)
+    try:
+        sys._base_executable = str(decoy)
+        check("a venv is stepped over to its base interpreter",
+              update.helper_python() == str(decoy), update.helper_python())
+        sys._base_executable = str(scratch() / "gone.exe")
+        check("and a base interpreter that is not there is not trusted",
+              update.helper_python() == sys.executable, update.helper_python())
+        sys._base_executable = sys.executable
+        check("a base that is this very interpreter changes nothing",
+              update.helper_python() == sys.executable, update.helper_python())
+    finally:
+        if had is None:
+            try:
+                del sys._base_executable
+            except AttributeError:
+                pass
+        else:
+            sys._base_executable = had
+
+    captured = []
+    real_popen = update.subprocess.Popen
+
+    def fake_popen(cmd, **kw):
+        captured.append(cmd)
+        raise OSError("stopped before the spawn, on purpose")
+
+    update.subprocess.Popen = fake_popen
+    try:
+        update.spawn_deferred(scratch())
+    finally:
+        update.subprocess.Popen = real_popen
+    check("the helper is started with it, never with a bare sys.executable",
+          bool(captured) and captured[-1][0] == update.helper_python()
+          and pathlib.Path(captured[-1][0]).is_file(),
+          str(captured[-1])[:200] if captured else "Popen was never reached")
+
+
 def main() -> int:
     url = serve()
     print(f"local manifest at {url}   (lingling {CURRENT})\n")
@@ -678,6 +1189,14 @@ def main() -> int:
     section_command(url)
     section_wiring(url)
     section_job()
+    section_nowindow()
+    section_question()
+    section_answers()
+    section_read()
+    section_notice_ask()
+    section_handoff()
+    section_launch(url)
+    section_helper_python()
 
     print()
     cleanup()
