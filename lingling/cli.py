@@ -1,4 +1,11 @@
-"""lingling -- official OpenCode, riding rotating Tor lanes."""
+"""lingling -- official OpenCode, riding rotating Tor lanes.
+
+Windows hands a console-mode child of a CONSOLE-LESS parent a brand new,
+VISIBLE console, so an opencode ``service restart`` or ``--help`` issued
+from a launch that has no console of its own would flash a terminal window
+for every call. Those two run quiet; the interactive TUI launch
+deliberately does not, because it must inherit the console it is shown in.
+"""
 
 from __future__ import annotations
 
@@ -738,7 +745,8 @@ def _uses_background_server(binary: str) -> bool:
     if _SERVER_ERA is None:
         try:
             out = subprocess.run([binary, "--help"], capture_output=True,
-                                 text=True, timeout=15).stdout or ""
+                                 text=True, timeout=15,
+                                 creationflags=netutil._NO_WINDOW).stdout or ""
             _SERVER_ERA = "--standalone" in out
         except Exception:  # noqa: BLE001
             _SERVER_ERA = False
@@ -767,7 +775,8 @@ def _server(binary: str, env: dict, action: str) -> None:
             os.environ[name] = env[name]
     try:
         subprocess.run([binary, "service", action], capture_output=True,
-                       text=True, timeout=60)
+                       text=True, timeout=60,
+                       creationflags=netutil._NO_WINDOW)
     except Exception:  # noqa: BLE001
         pass
     finally:

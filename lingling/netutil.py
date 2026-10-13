@@ -1,4 +1,11 @@
-"""Loopback + SOCKS5 network helpers."""
+"""Loopback + SOCKS5 network helpers.
+
+Windows gives a console-mode child of a CONSOLE-LESS parent a brand new
+console, and a new console is a visible window, so every process this
+module runs -- tasklist, netstat, taskkill -- passes CREATE_NO_WINDOW.
+Measured: 20 unflagged tasklist spawns from a console-less parent peaked
+at 2 visible console windows; the same 20 with the flag stayed at 1.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +20,14 @@ import time
 from typing import Optional, Container, Tuple
 
 PORT_CHECK_TIMEOUT = 1.0
+
+#: quiet spawns
+_NO_WINDOW = 0x08000000
+
+
+def _quiet() -> dict:
+    """creationflags that keep a console tool from opening a window."""
+    return {"creationflags": _NO_WINDOW} if os.name == "nt" else {}
 
 """opencode's own "endpoint unavailable" error body -- a 429 that is NOT
 the exit's limit"""
@@ -29,7 +44,8 @@ def _pid_alive_local(pid: int) -> bool:
             return False
     try:
         output = subprocess.check_output(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], text=True, timeout=5)
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], text=True,
+            timeout=5, **_quiet())
         return str(pid) in output and "No tasks" not in output
     except Exception:
         return False
@@ -146,7 +162,8 @@ def pid_on_port(port: int) -> Optional[int]:
     if platform.system().lower() != "windows":
         return None
     try:
-        output = subprocess.check_output(["netstat", "-ano"], text=True, timeout=5)
+        output = subprocess.check_output(["netstat", "-ano"], text=True,
+                                         timeout=5, **_quiet())
         for line in output.splitlines():
             if f"127.0.0.1:{port}" in line:
                 parts = line.strip().split()
@@ -165,7 +182,8 @@ def _pid_alive(pid: int) -> bool:
         return False
     try:
         output = subprocess.check_output(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], text=True, timeout=5)
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], text=True,
+            timeout=5, **_quiet())
         return str(pid) in output and "No tasks" not in output
     except Exception:
         return False
@@ -176,7 +194,7 @@ def kill_pid(pid: int, grace_s: float = 2.0) -> bool:
         return False
     try:
         subprocess.run(["taskkill", "/PID", str(pid)],
-                       capture_output=True, text=True, timeout=10)
+                       capture_output=True, text=True, timeout=10, **_quiet())
     except Exception:
         pass
     deadline = time.time() + grace_s
@@ -186,7 +204,7 @@ def kill_pid(pid: int, grace_s: float = 2.0) -> bool:
         time.sleep(0.1)
     try:
         subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                       capture_output=True, text=True, timeout=10)
+                       capture_output=True, text=True, timeout=10, **_quiet())
         return True
     except Exception:
         return False
@@ -200,7 +218,7 @@ def pids_on_ports(ports: Container[int]) -> dict:
     found = {}
     try:
         output = subprocess.check_output(["netstat", "-ano"], text=True,
-                                         timeout=20)
+                                         timeout=20, **_quiet())
     except Exception:  # noqa: BLE001
         return {}
     for line in output.splitlines():

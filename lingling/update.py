@@ -123,13 +123,30 @@ pid = int(sys.argv[1])
 cmd = sys.argv[2:]
 deadline = time.time() + float(os.environ.get("LINGLING_HELPER_WAIT", "86400"))
 
+#: CREATE_NO_WINDOW, and it is not cosmetic. This helper has no console of
+#: its own (it is spawned DETACHED_PROCESS), and Windows hands every
+#: console-mode child of a console-less process a BRAND NEW console -- a
+#: visible one. Polling tasklist without this flag measured as a console
+#: window flashing twice a second for the whole session: the owner's
+#: report of "terminals spamming when the timer finished" was this loop,
+#: every time. Measured on Windows: 20 unflagged tasklist spawns from a
+#: console-less parent peaked at 2 visible console windows, the same 20
+#: with this flag stayed at 1.
+NO_WINDOW = 0x08000000
+
+#: The poll was twice a second, which is a lot of process churn to notice
+#: a process that has been dead for a while -- the install happens minutes
+#: after the session, not instantly after it. Two seconds halves the churn
+#: and is still immediate by any human measure.
+POLL_S = 2.0
+
 
 def alive(p):
     if os.name == "nt":
         try:
             out = subprocess.check_output(
                 ["tasklist", "/FI", "PID eq %d" % p, "/NH"],
-                text=True, timeout=10)
+                text=True, timeout=10, creationflags=NO_WINDOW)
             return str(p) in out and "No tasks" not in out
         except Exception:
             return True
@@ -143,13 +160,29 @@ def alive(p):
 while time.time() < deadline:
     if not alive(pid):
         break
-    time.sleep(0.5)
+    time.sleep(POLL_S)
 else:
     print("launcher still alive after the wait budget -- not installing")
     sys.exit(0)
 
 print("running: %s" % " ".join(cmd), flush=True)
-sys.exit(subprocess.call(cmd))
+# The installer is a console app too, and this helper is console-less: it
+# would otherwise flash a window for the length of the install. The
+# explicit handles below are not decoration either: a console child of a
+# console-less parent gets a NEW console, not this log, and with a bare
+# spawn the installer's own lines and its exit code were both discarded.
+# Measured on the shipped helper: update.log showed "running:" and then
+# nothing, so a failed install looked exactly like a quiet one. With the
+# handles, pip's output and the exit code land in the log.
+try:
+    rc = subprocess.call(
+        cmd, stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=sys.stderr,
+        creationflags=(NO_WINDOW if os.name == "nt" else 0))
+except OSError as exc:
+    print("installer did not start: %s" % exc, flush=True)
+    sys.exit(1)
+print("install exit: %d" % rc, flush=True)
+sys.exit(rc)
 '''
 
 
