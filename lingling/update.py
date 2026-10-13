@@ -97,11 +97,18 @@ to replace it -- so the install is handed to a small helper that waits
 for this process to end and only then runs pip. The upgrade lands
 between two launches, which is the only moment it is safe.
 
+When an update is waiting and you are at a terminal, the launch asks
+before scheduling it: Enter or `y` installs it once this session ends,
+`n` leaves it for `lingling update`. Without a terminal -- a shortcut,
+a service, a redirected input -- nothing is asked and the install is
+still scheduled, because a question nobody can answer is not a
+question.
+
 The check on launch is unobtrusive: a background thread, a three second
 timeout, and a six hour cache, so an offline machine is silent rather
 than slow. It only ever prints when there is something to say.
 
-    LINGLING_UPDATE=auto     check, notice, and install after the session (default)
+    LINGLING_UPDATE=auto     check, notice, ask, install after the session (default)
     LINGLING_UPDATE=notify   check and notice only -- never install for me
     LINGLING_UPDATE=off      do not check at all
     LINGLING_UPDATE_URL=...  check a different manifest endpoint
@@ -792,13 +799,144 @@ def spawn_deferred(data_dir, delay: Optional[float] = None):
     return proc.pid
 
 
-def auto_install(data_dir, info: Optional[dict]):
+# ---------------------------------------------------------------------------
+# the question
+# ---------------------------------------------------------------------------
+
+#: The question, asked at the handoff when an update is waiting and there
+#: is a terminal to ask on. Enter installs, which is also what the
+#: unattended path does -- so the default never strands a user on a
+#: question they did not expect, and never costs them a version either.
+PROMPT = "  install it when this session ends? [Y/n] "
+
+#: What a ``no`` says. One line, and it names both ways to get the
+#: install later -- otherwise "skipped" reads as "never", and the next
+#: launch asks again with no way to make it stop.
+SKIP_LINE = ("  ok -- skipped: `lingling update` installs it when you want, "
+             "and LINGLING_UPDATE=notify stops the question")
+
+
+#: A ``no``, in the shapes a person actually types.
+_NO = ("n", "no")
+
+
+def _console_stdin() -> bool:
+    """Will the OS really deliver a keystroke to this process's stdin?
+
+    ``isatty`` is not that question on Windows. Measured under a shell
+    whose stdin is an MSYS pty: ``sys.stdin.isatty()`` is True while
+    ``GetConsoleMode`` fails, ``msvcrt.kbhit()`` answers False rather
+    than raising, and the first ``input()`` raises EOFError -- so a
+    launch there would print a question, read nothing, and take the EOF
+    as a no, silently dropping an update in a launch that worked fine
+    before this question existed. Only a live console handle is asked
+    for an answer, and anything else falls back to installing after the
+    session, which is the behaviour every build has shipped with.
+    """
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        return bool(kernel32.GetConsoleMode(
+            kernel32.GetStdHandle(-10), ctypes.byref(ctypes.c_uint())))
+    except Exception:  # noqa: BLE001 -- no ctypes, no console, no question
+        return False
+
+
+def _at_terminal(stdout=None) -> bool:
+    """Are both ends of the question a terminal, one that can answer?
+
+    Both, not either. Somebody who runs ``lingling | tee log`` or drives
+    it from a script has handed one of the streams to another program,
+    and that program never agreed to answer a question written into its
+    input. A launch that cannot be asked is simply installed after, the
+    way it always was.
+
+    ``stdout`` is a seam, and the only one here: the test that pins the
+    Windows console rule has to ask this question without a terminal.
+    """
+    out = sys.stdout if stdout is None else stdout
+    try:
+        if not out.isatty():
+            return False
+        if os.name == "nt":
+            return _console_stdin()
+        return bool(sys.stdin.isatty())
+    except Exception:  # noqa: BLE001 -- a stream with no isatty at all
+        return False
+
+
+def _pending_input() -> bool:
+    """Is a keystroke already waiting? Peek, never consume it.
+
+    Launches get typed into: people queue their first question while the
+    lanes warm. Reading that line to answer this one would hand opencode
+    an empty prompt instead, so when one is waiting the question is not
+    asked at all. The peek is non-destructive on purpose; the exception
+    path answers "yes, something is there", because the alternative to a
+    mis-read is losing the user's first sentence.
+    """
+    try:
+        if os.name == "nt":
+            import msvcrt
+            return bool(msvcrt.kbhit())
+        import select
+        return bool(select.select([sys.stdin], [], [], 0)[0])
+    except Exception:  # noqa: BLE001 -- no console to ask
+        return True
+
+
+def askable(info: Optional[dict] = None) -> bool:
+    """Is there someone at a terminal who can answer, right now?
+
+    Three quiet noes, and each one of them is the old behaviour rather
+    than a failure: the mode does not install, there is nothing to
+    install, or there is no terminal (or someone is already typing).
+    """
+    if mode() != "auto" or not behind(info):
+        return False
+    return _at_terminal() and not _pending_input()
+
+
+def _ask(prompt: str, stream) -> str:
+    """Write the prompt, then read one line from the terminal.
+
+    Blocking, and that is the point: this runs at the handoff, when the
+    terminal is ours for a few seconds and the lanes are already hot. A
+    question that scrolls past unanswered is worse than one that waits.
+    Ctrl-C or a closed stdin reads as no, and the session still starts.
+    """
+    try:
+        stream.write(prompt)
+        stream.flush()
+    except Exception:  # noqa: BLE001 -- nowhere to ask means no
+        return "n"
+    try:
+        return input()
+    except (EOFError, KeyboardInterrupt):
+        _say(stream, "")
+        return "n"
+
+
+def auto_install(data_dir, info: Optional[dict], ask: bool = False,
+                 read=None, stream=None) -> Optional[int]:
     """Schedule the deferred install when the mode says to.
 
-    Called once per launch, so one upgrade per session at most.
+    Called once per launch, so one upgrade per session at most. With
+    ``ask``, the person at the terminal decides first: Enter or ``y``
+    installs it once this session ends, ``n`` leaves it to
+    ``lingling update``. Any other answer -- including the timeout-free
+    blocking read being interrupted -- keeps the install, because the
+    default has always been to keep up and a keystroke at the handoff
+    must never be a way to silently lose an upgrade.
     """
     if mode() != "auto" or not behind(info):
         return None
+    if ask:
+        stream = stream or sys.stderr
+        answer = (read or _ask)(PROMPT, stream)
+        if answer.strip().lower() in _NO:
+            _say(stream, SKIP_LINE)
+            return None
     return spawn_deferred(data_dir)
 
 

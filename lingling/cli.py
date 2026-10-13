@@ -472,16 +472,21 @@ def _uninstall(rest: list[str]) -> int:
 
 
 def _say_update(check_obj) -> None:
-    """The update notice, and the one install it may schedule.
+    """The update notice, the one question, and the one install.
 
-    Both are held until the terminal is handed over: the spinner owns
-    the line until then, and a notice printed under a live spinner is
-    erased by its next repaint. At most one install is scheduled per
+    All of it is held until the terminal is handed over: the spinner
+    owns the line until then, and a notice printed under a live spinner
+    is erased by its next repaint. At most one install is scheduled per
     session, and never while a lane is hot.
+
+    `askable` is decided here, once, and handed to both calls, so the
+    notice and the question can never disagree about who is being asked.
     """
-    update.emit(check_obj)
+    info = check_obj.info if check_obj is not None else None
+    ask = update.askable(info)
+    update.emit(check_obj, ask=ask)
     if check_obj is not None:
-        update.auto_install(DATA_DIR, check_obj.info)
+        update.auto_install(DATA_DIR, info, ask=ask)
 
 
 def main(argv: list[str]) -> int:
