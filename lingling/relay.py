@@ -235,7 +235,20 @@ class Relay:
         # score it
         self.tor.note_result(lane.exit_country, status)
         if self.tor.limit_hook is not None:
-            self.tor.limit_hook(lane, status)
+            try:
+                self.tor.limit_hook(lane, status)
+            except Exception as exc:  # noqa: BLE001
+                """Moving a lane is upkeep, not the request: the client
+                already made its call, so nothing a hook does here may
+                end in a traceback and a dropped connection. It did, on
+                a plain 429 whose relaunch hit a broken control probe."""
+                self._emit({
+                    "type": "lane", "kind": "fail", "t": time.time(),
+                    "lane": lane.index, "cc": lane.exit_country,
+                    "ip": lane.exit_ip,
+                    "msg": f"lane {lane.index} was refused ({status}) -- "
+                           f"moving it failed: {exc}",
+                })
             return
         # no daemon
         lane.healthy = False
