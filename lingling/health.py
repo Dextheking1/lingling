@@ -84,9 +84,16 @@ class HealthDaemon:
             self._stop.wait(self.check_interval)
 
     def reachable(self, lane: Lane, probe_timeout: float = PROBE_TIMEOUT) -> int:
-        """One hand-rolled request through the lane: its HTTP status, or 0 if nothing came back."""
+        """One hand-rolled request through the lane: its HTTP status, or 0 if nothing came back.
+
+        A 0 says only that this probe got no verdict, so the reason is
+        kept on the lane: a cold circuit that missed its window and a lane
+        that cannot carry a request at all used to print the same line.
+        """
+        lane.probe_note = ""
         if not netutil.port_is_open("127.0.0.1", lane.socks_port,
                                     timeout=netutil.PORT_CHECK_TIMEOUT):
+            lane.probe_note = "port closed"
             return 0
         code = 0
         body = b""
@@ -96,10 +103,12 @@ class HealthDaemon:
                 UPSTREAM_UA, body=_scan_body(PROBE_MODEL, PROBE_PATH),
                 timeout=probe_timeout,
                 cred=netutil.lane_cred(lane.index))
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            lane.probe_note = type(exc).__name__
             return 0
         if code == 429 and netutil.UPSTREAM_DOWN in body:
             """opencode is down, not the exit: no verdict about this lane"""
+            lane.probe_note = "opencode down"
             return 0
         try:
             c2, body = netutil.https_get_via_socks(
@@ -122,20 +131,27 @@ class HealthDaemon:
             # mid-launch
             if lane.healing:
                 continue
-            sticky = getattr(self.tor, "sticky", None)
-            if sticky is not None and sticky.frozen(lane.index):
-                # frozen lane
-                continue
             # down
             if (lane.process is None or lane.process.poll() is not None
                     or not lane.healthy):
-                if self.tor.restart_lane(lane):
-                    self._emit_lane(
-                        lane, "up",
-                        f"lane {lane.index} was down -- brought it back")
+                self._revive(lane)
+                continue
+            """
+            Nothing listening on the lane's own SOCKS port is a lane that
+            is down, however alive its process handle still looks: its tor
+            died, or its port moved out from under it. Probing would only
+            report that nothing came back -- which is deliberately not a
+            verdict -- so such a lane was never revived and never served
+            again while its request bounced off a closed port.
+            """
+            if not netutil.port_is_open("127.0.0.1", lane.socks_port,
+                                        timeout=netutil.PORT_CHECK_TIMEOUT):
+                lane.probe_code = -1
+                self._revive(lane)
                 continue
             if lane.asked:
                 continue
+            """Every lane carries every call now, so every lane is judged."""
             code = self.reachable(lane)
             if code == 429:
                 #: burnt
@@ -153,10 +169,12 @@ class HealthDaemon:
             # no verdict
             if lane.probe_code != code:
                 lane.probe_code = code
+                note = getattr(lane, "probe_note", "")
                 self._emit_lane(
                     lane, "probe",
-                    f"lane {lane.index} probe got {code or 'nothing'} -- "
-                    f"not a verdict, re-asking next sweep")
+                    f"lane {lane.index} probe got {code or 'nothing'}"
+                    + (f" ({note})" if note else "")
+                    + " -- not a verdict, re-asking next sweep")
 
     def on_refused(self, lane: Lane, status: int = 429) -> None:
         """A real 429 from the far end: move this lane to a different country."""
@@ -171,6 +189,27 @@ class HealthDaemon:
                 lane, "limited",
                 f"lane {lane.index} was refused ({status}) -- moved to "
                 f"{{{moved or lane.exit_country}}}")
+
+    def _revive(self, lane: Lane) -> None:
+        """Bring a down lane back, and say so either way.
+
+        Only a successful revive used to be reported. A lane that could
+        never come back -- because a tor that outlived its stop still held
+        the lane's data directory -- therefore looked exactly like a lane
+        that was simply never needed, and the failure stayed invisible for
+        a whole session.
+        """
+        if self.tor.restart_lane(lane):
+            lane.down_reported = False
+            self._emit_lane(
+                lane, "up",
+                f"lane {lane.index} was down -- brought it back")
+            return
+        if not getattr(lane, "down_reported", False):
+            lane.down_reported = True
+            self._emit_lane(
+                lane, "down",
+                f"lane {lane.index} is down -- could not bring it back")
 
     def _emit_lane(self, lane: Lane, kind: str, message: str) -> None:
         self._emit({

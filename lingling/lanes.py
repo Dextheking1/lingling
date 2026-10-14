@@ -46,6 +46,32 @@ USED_TTL_S = float(os.environ.get("LINGLING_FRESH_S", "86400"))
 #: port search
 _PORT_SEARCH = 4000
 
+
+def _leftover_ports(pid: int, held: Dict[int, int],
+                    socks_base: int, control_base: int) -> List[int]:
+    """The control ports a leftover tor of ours might still answer on.
+
+    The torrcs cannot say. Re-rolling a lane's ports rewrites its torrc,
+    which hides a tor left over from before the rewrite -- and that stray
+    is exactly the one holding the lane's port against every later boot.
+
+    A lane's two ports always sit the same distance apart, so a leftover's
+    control port reads straight off the port it still holds.
+    """
+    ports: List[int] = []
+    for port, owner in held.items():
+        if owner != pid:
+            continue
+        if control_base <= port < control_base + _PORT_SEARCH:
+            derived = port
+        elif socks_base <= port < socks_base + _PORT_SEARCH:
+            derived = control_base + (port - socks_base)
+        else:
+            continue
+        if derived not in ports:
+            ports.append(derived)
+    return ports
+
 #: rotation cursor
 _ROTATION_MEMORY = 8
 
@@ -54,6 +80,8 @@ CONFLUX = os.environ.get("LINGLING_CONFLUX", "0")
 
 #: drain grace
 _DRAIN_S = 5.0
+"""Longest a deferred move waits for a lane's streams."""
+_DEFER_MAX_S = 900.0
 
 #: expansion pool
 EXPAND_COUNTRIES = [
@@ -99,8 +127,14 @@ class Lane:
     asked: bool = False
     #: last probe
     probe_code: int = -1
+    #: probe reason
+    probe_note: str = ""
+    #: failed revive
+    down_reported: bool = False
     #: live tunnels
     active: int = 0
+    #: deferred move
+    deferred_at: float = 0.0
     #: last pick
     last_used_at: float = 0.0
     #: last real
@@ -120,26 +154,22 @@ class Lane:
         return self.data_dir / "torrc"
 
     def running(self) -> bool:
-        if self.process is not None and self.process.poll() is None:
-            return True
-        return netutil.port_is_open("127.0.0.1", self.socks_port, timeout=0.1)
+        return self.process is not None and self.process.poll() is None
 
 
 class StickyState:
-    """Ride the first lane that answers fast, and keep routing until it does.
+    """Name the quickest lane, and start every round of the race on it.
 
-    One rule, and one only: requests cycle the healthy lanes in index order,
-    and the first attempt whose first event lands at or under ``_FAST_S``
-    (5s) wins the session on the spot -- no second opinion, and no waiting
-    for the rest of the pool to report. A lane slower than the threshold is
-    simply passed over, and the next request tries the next lane.
+    One rule, and one only: the first answer whose first event lands at or
+    under ``_FAST_S`` (5s) is the quickest lane of the session, and it is
+    the lane the next round dials first. Every request goes out on every
+    healthy lane at once -- see ``mitm`` -- so this is a name and a
+    starting lane, never an exclusive ride.
 
-    The ride ends when the winner crosses the release ceiling (15s) or takes
+    The lead ends when that lane crosses the release ceiling (15s) or takes
     any verdict -- timeout, SSL cut, slow first event, or 429 -- at which
-    point the router wakes and starts routing again for the next lane that
-    answers under the threshold. This is a routing choice above
-    ``pick_lane``: no lane is ever capped, and benched lanes stay healthy
-    and are tried again the moment routing resumes.
+    point the election reopens and the next fast answer takes the lead. No
+    lane is ever capped, and a lane that lost a round is not benched.
     """
 
     def __init__(self, tor: "TorManager",
@@ -182,13 +212,13 @@ class StickyState:
             self._cursor += 1
             self._touch(lane)
             if not self._announced:
-                # routing begins
+                # race begins
                 self._announced = True
                 self._emit({
                     "type": "lane", "kind": "sticky", "t": time.time(),
                     "lane": 0, "cc": "", "ip": "",
-                    "msg": f"routing {len(lanes)} lanes -- riding the first "
-                           f"that answers under {_FAST_S:.0f}s",
+                    "msg": f"racing {len(lanes)} lanes -- the first answer "
+                           f"takes it",
                 })
             return lane
 
@@ -200,11 +230,6 @@ class StickyState:
             if secs <= _FAST_S:
                 # fast enough
                 self._stick(lane_index, secs)
-
-    def frozen(self, lane_index: int) -> bool:
-        """True while a stick keeps this lane idle; it wakes on release."""
-        with self._lock:
-            return self.phase == "stuck" and lane_index != self.winner
 
     def stuck_on(self, lane_index: int) -> bool:
         """True when this lane is the one we are stuck on."""
@@ -232,7 +257,7 @@ class StickyState:
         lane.last_real_at = time.time()
 
     def _stick(self, lane_index: int, secs: float) -> None:
-        """The fast lane becomes the one we ride until it falters."""
+        """The fast lane is named the quickest, and leads the next round."""
         lane = self._lane(lane_index)
         if lane is None:
             return
@@ -244,11 +269,11 @@ class StickyState:
             "lane": lane_index, "cc": lane.exit_country,
             "ip": lane.exit_ip,
             "msg": f"lane {lane_index} {{{lane.exit_country}}} answered in "
-                   f"{secs:.1f}s -- riding it",
+                   f"{secs:.1f}s -- quickest lane",
         })
 
     def _wake(self) -> None:
-        """Back to routing: look for the next lane under the threshold."""
+        """Back to electing: the next fast answer takes the lead."""
         fell = self.winner
         self.phase = "routing"
         self.winner = None
@@ -257,7 +282,7 @@ class StickyState:
         self._emit({
             "type": "lane", "kind": "sticky", "t": time.time(),
             "lane": fell or 0, "cc": "", "ip": "",
-            "msg": f"lane {fell} faltered -- routing again for a lane "
+            "msg": f"lane {fell} faltered -- re-electing the quickest "
                    f"under {_FAST_S:.0f}s",
         })
 
@@ -325,6 +350,8 @@ class TorManager:
         self.limit_hook: Optional[Callable[[Lane], None]] = None
         #: sticky router
         self.sticky = StickyState(self)
+        #: pane hook
+        self._emit: Callable[[Dict], None] = lambda e: None
         self._tor_executable: Optional[Path] = None
         self._stopping = False
         #: rebuild threads
@@ -332,6 +359,10 @@ class TorManager:
         self.tools_dir.mkdir(parents=True, exist_ok=True)
         self.lanes_dir.mkdir(parents=True, exist_ok=True)
         self._load_existing()
+
+    def attach(self, emit: Callable[[Dict], None]) -> None:
+        """The pane hears the moves this pool makes."""
+        self._emit = emit or (lambda e: None)
 
     # setup
     def _load_existing(self) -> None:
@@ -585,9 +616,122 @@ class TorManager:
              for i in span])
         killed = 0
         for pid in set(held.values()):
-            if netutil.kill_pid(pid, grace_s=1):
+            if self._stop_orphan(pid, _leftover_ports(
+                    pid, held, self.socks_base, self.control_base)):
                 killed += 1
         return killed
+
+    def _stop_orphan(self, pid: int,
+                     ports: Optional[List[int]] = None,
+                     only: Optional[Path] = None) -> bool:
+        """Authenticate a saved Tor control endpoint and verify ownership.
+
+        Ports alone never authorize a kill. The saved cookie must open the
+        endpoint, the PID it reports must be the one found listening, and
+        its data directory must be one of ours. Only then is Tor asked to
+        shut down.
+
+        ``ports`` are the control ports worth asking. The current torrcs
+        alone are not enough: a lane that was re-rolled had its torrc
+        rewritten, which is what hides the tor its card used to name.
+
+        ``only`` narrows that to a single lane: the endpoint must own the
+        given data directory and nothing else, which is how a tor that
+        outlived its stop is found without touching a healthy neighbour.
+        """
+        stem = _stem()
+        if stem is None:
+            return False
+        root = self.lanes_dir.resolve()
+        cookies = [p for p in self.lanes_dir.glob("tor-*/control_auth_cookie")
+                   if p.is_file()]
+        if not cookies:
+            return False
+        if only is not None:
+            # own lane
+            wanted = only.resolve()
+            own = wanted / "control_auth_cookie"
+            cookies.sort(key=lambda p: p != own)
+        if ports is None:
+            ports = []
+            for config in self.lanes_dir.glob("tor-*/torrc"):
+                try:
+                    lines = config.read_text(encoding="utf-8").splitlines()
+                    control = next(line.split()[1] for line in lines
+                                   if line.startswith("ControlPort "))
+                    ports.append(int(control.rsplit(":", 1)[-1]))
+                except (OSError, ValueError, IndexError, StopIteration):
+                    continue
+        for port in ports:
+            for cookie in cookies:
+                try:
+                    with stem.control.Controller.from_port(port=port) as ctl:
+                        deadline = threading.Timer(2.0, ctl.close)
+                        deadline.daemon = True
+                        deadline.start()
+                        try:
+                            """`suppress_ctl_errors=False` on purpose: stem
+                            1.8.2 builds AuthChallengeFailed with a third
+                            argument its constructor does not take, so the
+                            suppressing path turns an endpoint that failed
+                            mid-probe -- a SOCKS port dialled as a control
+                            port, a tor that just died -- into a TypeError
+                            nothing here expects. Asking for the real error
+                            keeps that a plain, caught ControllerError."""
+                            stem.connection.authenticate_safecookie(
+                                ctl, cookie_path=str(cookie),
+                                suppress_ctl_errors=False)
+                            if ctl.get_pid() != pid:
+                                continue
+                            actual = Path(
+                                ctl.get_conf("DataDirectory")).resolve()
+                            if only is not None:
+                                if actual != only.resolve():
+                                    continue
+                            elif actual != root and root not in actual.parents:
+                                continue
+                            ctl.signal(stem.Signal.SHUTDOWN)
+                            return True
+                        finally:
+                            deadline.cancel()
+                except (OSError, ValueError, IndexError, StopIteration,
+                        stem.ControllerError,
+                        stem.connection.AuthenticationFailure):
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    """An endpoint that fails in a way we did not foresee
+                    still says one thing only -- ownership is unproven --
+                    and that may never take a boot, or the request whose
+                    refusal triggered this, down with it."""
+                    self.log("orphan probe on %d: %s", port, exc)
+                    continue
+        return False
+
+    def _clear_lane_dir_owner(self, lane: Lane) -> bool:
+        """Stop any tor of ours still holding this lane's data directory.
+
+        A tor that outlived its stop keeps the directory locked, so the
+        replacement tor comes up far enough to log "another Tor process is
+        running with the same data directory" and then gives up -- which
+        leaves the lane on a port nothing serves, for the rest of the
+        session, on every later launch.
+
+        Clearing the holder is what lets the relaunch actually take. The
+        lane it belongs to is fixed by the authenticated data directory,
+        so a healthy neighbour can never be caught by this.
+        """
+        if os.name != "nt":
+            return False
+        held = netutil.pids_on_ports(
+            [base + i for base in (self.socks_base, self.control_base)
+             for i in range(_PORT_SEARCH)])
+        cleared = False
+        for pid in set(held.values()):
+            ports = _leftover_ports(pid, held, self.socks_base,
+                                    self.control_base)
+            if self._stop_orphan(pid, ports, only=lane.data_dir):
+                cleared = True
+        return cleared
 
     def _prune_lane_dirs(self) -> int:
         """Delete the data directories of lanes this pool does not have.
@@ -640,12 +784,19 @@ class TorManager:
             lane.data_dir.joinpath("boot.log").write_text("")
         except OSError:
             pass
-        for port in (lane.socks_port, lane.control_port):
-            if netutil.port_is_open("127.0.0.1", port):
-                pid = netutil.pid_on_port(port)
-                if pid:
-                    netutil.kill_pid(pid, grace_s=2)
-                    time.sleep(0.2)
+        if any(netutil.port_is_open("127.0.0.1", port)
+               for port in (lane.socks_port, lane.control_port)):
+            try:
+                reserved = {p for item in self.lanes if item is not lane
+                            for p in (item.socks_port, item.control_port)}
+                lane.socks_port = netutil.find_free_port(
+                    self.socks_base + lane.index - 1, reserved=reserved)
+                reserved.add(lane.socks_port)
+                lane.control_port = netutil.find_free_port(
+                    self.control_base + lane.index - 1, reserved=reserved)
+                self._write_torrc(lane)
+            except RuntimeError:
+                return "failed"
         if self._stopping:
             return "skipped"
         stem = _stem()
@@ -702,6 +853,7 @@ class TorManager:
                             config: Dict[str, str], msg_handler) -> Any:
         """stem's timeout uses SIGALRM (POSIX only), so we race its launcher thread against ``boot_timeout`` ..."""
         result_q: "queue.Queue" = queue.Queue()
+        abandoned = threading.Event()
 
         def _do_launch() -> None:
             try:
@@ -713,9 +865,18 @@ class TorManager:
                     close_output=False,
                     completion_percent=0,
                 )
-                result_q.put(("ok", proc))
             except BaseException as exc:  # noqa: BLE001
                 result_q.put(("err", exc))
+                return
+            if abandoned.is_set():
+                """The boot window closed while tor was still starting.
+
+                Nobody holds a handle to this one any more, so it is ended
+                here rather than left on the lane's own port.
+                """
+                self._kill(proc)
+                return
+            result_q.put(("ok", proc))
 
         threading.Thread(target=_do_launch, daemon=True,
                          name=f"tor-launch-{lane.index}").start()
@@ -723,16 +884,31 @@ class TorManager:
             kind, payload = result_q.get(timeout=self.boot_timeout)
         except queue.Empty:
             # no bootstrap
-            for port in (lane.control_port, lane.socks_port):
-                pid = netutil.pid_on_port(port)
-                if pid:
-                    netutil.kill_pid(pid, grace_s=1)
+            abandoned.set()
+            try:
+                kind, payload = result_q.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                if kind == "ok" and payload is not None:
+                    self._kill(payload)
+            for pid in set(netutil.pids_on_ports(
+                    {lane.control_port, lane.socks_port}).values()):
+                self._stop_orphan(pid)
             raise RuntimeError(
                 f"tor lane #{lane.index} did not start within "
                 f"{self.boot_timeout}s")
         if kind == "err":
             raise RuntimeError(f"tor lane #{lane.index} launch failed: {payload}")
         return payload
+
+    def _kill(self, proc: Any) -> None:
+        """End a tor we launched and no longer hold a handle to."""
+        try:
+            proc.kill()
+            proc.wait(timeout=3)
+        except Exception:  # noqa: BLE001
+            pass
 
     def stop_all(self) -> None:
         """Stop every lane we started."""
@@ -753,24 +929,45 @@ class TorManager:
         for t in list(self._rebuilds):
             t.join(timeout=5)
 
-    def _stop_lane_process(self, lane: Lane) -> None:
-        if lane.process is None:
-            return
-        try:
-            lane.process.terminate()
-            lane.process.wait(timeout=3)
-        except Exception:  # noqa: BLE001
-            try:
-                lane.process.kill()
-            except Exception:  # noqa: BLE001
-                pass
-        lane.process = None
+    def _stop_lane_process(self, lane: Lane) -> bool:
+        """Stop this lane's tor, and say whether it is really gone.
+
+        The old version cleared the handle whether or not the process had
+        died. That is how a tor that refused to exit kept the lane's data
+        directory locked against every later launch of the same lane, and
+        how the lane ended up on a port nothing served.
+        """
         lane.boot_ok = False
         lane.healthy = False
         lane.exit_ip = ""
         lane.asked = False
+        # new exit
+        lane.probe_code = -1
+        lane.probe_note = ""
         # on purpose
         lane.wanted = False
+        proc = lane.process
+        lane.process = None
+        if proc is None:
+            return True
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        for _ in range(10):
+            try:
+                if proc.poll() is not None:
+                    return True
+            except Exception:  # noqa: BLE001
+                return True
+            time.sleep(0.2)
+        self.log("lane #%d did not exit -- its directory is still locked",
+                 lane.index)
+        return False
 
     def lane_bootstrap_pct(self, lane: Lane) -> int:
         """Best-known bootstrap percent from the lane's boot.log; -1 = no evidence of progress recorded."""
@@ -805,10 +1002,66 @@ class TorManager:
         deadline = time.time() + timeout
         while lane.active > 0 and time.time() < deadline:
             time.sleep(0.2)
+        if lane.active > 0:
+            """One line for the whole drain, not one per stream."""
+            self._emit({
+                "type": "lane", "kind": "fail", "t": time.time(),
+                "lane": lane.index, "cc": lane.exit_country,
+                "ip": lane.exit_ip,
+                "msg": f"lane {lane.index} recooked -- "
+                       f"{lane.active} streams cut",
+            })
+
+    def _defer_rebuild(self, lane: Lane, repin: bool = False) -> None:
+        """Recook a loaded lane once its streams are done, not under them."""
+        if lane.deferred_at:
+            return
+        lane.deferred_at = time.time()
+        self._emit({
+            "type": "lane", "kind": "heal", "t": time.time(),
+            "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
+            "msg": f"lane {lane.index} has {lane.active} streams in flight "
+                   f"-- moving it once they finish",
+        })
+
+        def watch() -> None:
+            deadline = time.time() + _DEFER_MAX_S
+            while (not self._stopping and lane.active > 0
+                   and time.time() < deadline):
+                time.sleep(0.5)
+            lane.deferred_at = 0.0
+            if self._stopping:
+                return
+            moved = self.restart_lane(lane, repin=repin)
+            if moved:
+                self._emit({
+                    "type": "lane", "kind": "up", "t": time.time(),
+                    "lane": lane.index, "cc": lane.exit_country,
+                    "ip": lane.exit_ip,
+                    "msg": f"lane {lane.index} recooked -- "
+                           f"{{{lane.exit_country}}} once its streams "
+                           f"finished",
+                })
+
+        t = threading.Thread(target=watch, name=f"defer-{lane.index}",
+                             daemon=True)
+        self._rebuilds = [x for x in self._rebuilds if x.is_alive()]
+        self._rebuilds.append(t)
+        t.start()
 
     def restart_lane(self, lane: Lane, repin: bool = False) -> bool:
         """Re-cook a lane, re-pinning it first if its relay was limited."""
         if self._stopping:
+            return False
+        if lane.active > 0:
+            """A lane with streams in flight is a lane somebody is waiting
+            on. Retiring it stops its tor, and every open stream dies on the
+            spot: one thirty-second timeout on a metadata fetch, queued
+            behind thirty live answers, used to take all thirty with it. The
+            verdict already benched the exit, so the recook can wait for
+            them -- and one line says so instead of thirty.
+            """
+            self._defer_rebuild(lane, repin)
             return False
         # live requests
         self._drain(lane)
@@ -820,12 +1073,9 @@ class TorManager:
         # fresh exit
         lane.limited_until = 0.0
         self._stop_lane_process(lane)
-        for port in (lane.socks_port, lane.control_port):
-            if netutil.port_is_open("127.0.0.1", port):
-                pid = netutil.pid_on_port(port)
-                if pid:
-                    netutil.kill_pid(pid, grace_s=2)
-                time.sleep(0.2)
+        """Whether or not the tracked tor died, nothing of ours may still
+        hold this lane's directory before a replacement tries to take it."""
+        self._clear_lane_dir_owner(lane)
         if repinned or not lane.torrc_path().exists():
             self._write_torrc(lane)
         return self._launch_lane(lane) in ("started", "already_running")
@@ -835,11 +1085,7 @@ class TorManager:
         if self._stopping:
             return False
         self._stop_lane_process(lane)
-        for port in (lane.socks_port, lane.control_port):
-            if netutil.port_is_open("127.0.0.1", port):
-                pid = netutil.pid_on_port(port)
-                if pid:
-                    netutil.kill_pid(pid, grace_s=2)
+        self._clear_lane_dir_owner(lane)
         if lane.data_dir.exists():
             shutil.rmtree(lane.data_dir, ignore_errors=True)
         lane.data_dir.mkdir(parents=True, exist_ok=True)
