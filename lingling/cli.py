@@ -505,11 +505,22 @@ def main(argv: list[str]) -> int:
             "In one sentence: who are you, and what exit node do you think "
             "this request came from?")
         lanes = opts["lanes"] if opts.get("lanes_explicit") else 2
-        return run_demo(question, lanes=lanes)
+        try:
+            other = _other_lingling()
+        except OSError as exc:
+            print(f"lingling: cannot claim session lock: {exc}")
+            return 1
+        if other:
+            print("lingling is already running -- one kitchen, one session.")
+            return 1
+        try:
+            return run_demo(question, lanes=lanes)
+        finally:
+            netutil.release_session_lock(DATA_DIR)
 
     if "--version" in opts["passthrough"] or "-v" in opts["passthrough"]:
         print(f"lingling {__version__} (wraps opencode)")
-        # From cache only: asking the version must not cost a request.
+        """From cache only: asking the version must not cost a request."""
         update.cached_hint(DATA_DIR)
         return 0
 
@@ -531,12 +542,23 @@ def main(argv: list[str]) -> int:
     owner, so a second launcher is turned away before any lane, relay,
     or opencode exists.
     """
-    other = _other_lingling()
+    try:
+        other = _other_lingling()
+    except OSError as exc:
+        print(f"lingling: cannot claim session lock: {exc}")
+        return 1
     if other:
         print(_c(f"lingling is already running (pid {other}) -- one kitchen, "
                  f"one session. Close that window first.", "33"))
         return 1
 
+    try:
+        return _session(opts, opencode)
+    finally:
+        netutil.release_session_lock(DATA_DIR)
+
+
+def _session(opts: dict, opencode: str) -> int:
     _migrate_countries()
     _spawn_geoip_fallback()
     """
@@ -587,6 +609,7 @@ def main(argv: list[str]) -> int:
             else:
                 emit = proof.make_emitter(PROOF_LOG)
                 manager.sticky.attach(emit)
+                manager.attach(emit)
                 daemon = HealthDaemon(manager, event=emit,
                                       log=lambda *a: None)
 
@@ -672,13 +695,16 @@ def main(argv: list[str]) -> int:
         end_code.append(code)
         return code
     finally:
-        netutil.release_session_lock(DATA_DIR)
-        if daemon:
-            daemon.stop()
-        if relay:
-            relay.stop()
-        if manager and not direct:
-            manager.stop_all()
+        try:
+            if daemon:
+                daemon.stop()
+        finally:
+            try:
+                if relay:
+                    relay.stop()
+            finally:
+                if manager and not direct:
+                    manager.stop_all()
         if emit:
             try:
                 if end_code:
@@ -750,7 +776,8 @@ def _uses_background_server(binary: str) -> bool:
     if _SERVER_ERA is None:
         try:
             out = subprocess.run([binary, "--help"], capture_output=True,
-                                 text=True, timeout=15,
+                                 text=True, encoding="utf-8",
+                                 errors="replace", timeout=15,
                                  creationflags=netutil._NO_WINDOW).stdout or ""
             _SERVER_ERA = "--standalone" in out
         except Exception:  # noqa: BLE001
@@ -779,9 +806,13 @@ def _server(binary: str, env: dict, action: str) -> None:
         if env.get(name) is not None:
             os.environ[name] = env[name]
     try:
+        """Decode as UTF-8 with ``errors="replace"``: a ``text=True`` read
+        of this binary's output dies on cp1252 for any character outside it,
+        and the exception is swallowed below -- a restart that never
+        happened, reported as a session with no proxy at all."""
         subprocess.run([binary, "service", action], capture_output=True,
-                       text=True, timeout=60,
-                       creationflags=netutil._NO_WINDOW)
+                       text=True, encoding="utf-8", errors="replace",
+                       timeout=60, creationflags=netutil._NO_WINDOW)
     except Exception:  # noqa: BLE001
         pass
     finally:
@@ -808,20 +839,21 @@ def _run_opencode(binary: str, args: list[str],
         # our relay
         _server(binary, env, "restart")
     try:
-        proc = subprocess.Popen([binary, *args], env=env)
-    except OSError as exc:
-        print(f"lingling: couldn't launch opencode: {exc}")
-        return 1
-    try:
-        code = proc.wait()
-    except KeyboardInterrupt:
-        print(_c(" Ctrl+C -- closing the kitchen.", "90"), flush=True)
         try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except Exception:  # noqa: BLE001
-            pass
-        return 130
+            proc = subprocess.Popen([binary, *args], env=env)
+        except OSError as exc:
+            print(f"lingling: couldn't launch opencode: {exc}")
+            return 1
+        try:
+            code = proc.wait()
+        except KeyboardInterrupt:
+            print(_c(" Ctrl+C -- closing the kitchen.", "90"), flush=True)
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+            return 130
     finally:
         if server:
             _server(binary, env, "stop")

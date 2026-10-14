@@ -2,13 +2,14 @@
 
 Windows gives a console-mode child of a CONSOLE-LESS parent a brand new
 console, and a new console is a visible window, so every process this
-module runs -- tasklist, netstat, taskkill -- passes CREATE_NO_WINDOW.
+module runs -- tasklist and netstat -- passes CREATE_NO_WINDOW.
 Measured: 20 unflagged tasklist spawns from a console-less parent peaked
 at 2 visible console windows; the same 20 with the flag stayed at 1.
 """
 
 from __future__ import annotations
 
+import errno
 import os
 import pathlib
 import platform
@@ -16,6 +17,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import threading
 import time
 from typing import Optional, Container, Tuple
 
@@ -48,50 +50,79 @@ def _pid_alive_local(pid: int) -> bool:
             timeout=5, **_quiet())
         return str(pid) in output and "No tasks" not in output
     except Exception:
-        return False
+        return True
+
+
+_session_mutex = threading.Lock()
+_session_handles: dict[pathlib.Path, int] = {}
 
 
 def session_lock(data_dir: str) -> Optional[int]:
-    """Claim the one-session lock, or report the pid that holds it.
+    """Hold an OS lock until release; None acquired, pid/-1 busy, OSError failed.
 
-    A lock with no live owner behind it is wreckage from a hard kill:
-    it is overwritten, not honoured. Creation is exclusive, so two
-    racers cannot both win; the loser re-reads and either sees the
-    winner's pid or takes the file once the winner releases it.
+    The stable guard is never unlinked: removing a locked inode would let
+    another process lock a different file. The PID file remains compatible
+    with older running installs, but is not the synchronization primitive.
     """
-    path = pathlib.Path(data_dir) / "session.lock"
-    try:
+    path = pathlib.Path(data_dir).resolve() / "session.lock"
+    with _session_mutex:
+        if path in _session_handles:
+            return os.getpid()
         path.parent.mkdir(parents=True, exist_ok=True)
-        while True:
+        fd = os.open(str(path.with_name("session.guard")),
+                     os.O_CREAT | os.O_RDWR, 0o600)
+        acquired = False
+        try:
             try:
-                fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                with os.fdopen(fd, "w") as f:
-                    f.write(str(os.getpid()))
-                return None
-            except FileExistsError:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
                 try:
                     text = path.read_text(encoding="utf-8").strip()
-                    pid = int(text) if text.isdigit() else 0
                 except OSError:
-                    pid = 0
-                if pid and _pid_alive_local(pid):
-                    return pid
-                try:
-                    path.unlink()
-                except OSError:
-                    return 0
-    except OSError:
-        return 0
+                    text = ""
+                return int(text) if text.isdigit() and int(text) > 0 else -1
+            acquired = True
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                text = ""
+            pid = int(text) if text.isdigit() else 0
+            if pid and _pid_alive_local(pid):
+                return pid
+            path.write_text(str(os.getpid()), encoding="utf-8")
+            _session_handles[path] = fd
+            fd = -1
+            return None
+        finally:
+            if fd != -1:
+                if acquired and os.name == "nt":
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                os.close(fd)
 
 
 def release_session_lock(data_dir: str) -> None:
-    """Drop the lock this process owns; a pid check keeps it honest."""
-    path = pathlib.Path(data_dir) / "session.lock"
-    try:
-        if path.read_text(encoding="utf-8").strip() == str(os.getpid()):
-            path.unlink()
-    except OSError:
-        pass
+    """Remove our PID before releasing the stable, OS-held guard."""
+    path = pathlib.Path(data_dir).resolve() / "session.lock"
+    with _session_mutex:
+        fd = _session_handles.pop(path, None)
+        if fd is None:
+            return
+        try:
+            if path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                path.unlink()
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
 
 #: circuit slots
 SOCKS_SLOTS = int(os.environ.get("LINGLING_SOCKS_SLOTS", "8"))
@@ -158,58 +189,6 @@ def find_free_port(start_port: int, host: str = "127.0.0.1",
     raise RuntimeError(f"no free TCP port found near {start_port} on {host}")
 
 
-def pid_on_port(port: int) -> Optional[int]:
-    if platform.system().lower() != "windows":
-        return None
-    try:
-        output = subprocess.check_output(["netstat", "-ano"], text=True,
-                                         timeout=5, **_quiet())
-        for line in output.splitlines():
-            if f"127.0.0.1:{port}" in line:
-                parts = line.strip().split()
-                if parts:
-                    try:
-                        return int(parts[-1])
-                    except ValueError:
-                        pass
-    except Exception:
-        pass
-    return None
-
-
-def _pid_alive(pid: int) -> bool:
-    if platform.system().lower() != "windows":
-        return False
-    try:
-        output = subprocess.check_output(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], text=True,
-            timeout=5, **_quiet())
-        return str(pid) in output and "No tasks" not in output
-    except Exception:
-        return False
-
-
-def kill_pid(pid: int, grace_s: float = 2.0) -> bool:
-    if platform.system().lower() != "windows":
-        return False
-    try:
-        subprocess.run(["taskkill", "/PID", str(pid)],
-                       capture_output=True, text=True, timeout=10, **_quiet())
-    except Exception:
-        pass
-    deadline = time.time() + grace_s
-    while time.time() < deadline:
-        if not _pid_alive(pid):
-            return True
-        time.sleep(0.1)
-    try:
-        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                       capture_output=True, text=True, timeout=10, **_quiet())
-        return True
-    except Exception:
-        return False
-
-
 def pids_on_ports(ports: Container[int]) -> dict:
     """``{port: pid}`` for the given ports that something is LISTENING on."""
     if platform.system().lower() != "windows":
@@ -242,10 +221,16 @@ def pids_on_ports(ports: Container[int]) -> dict:
     return found
 
 
-def _recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
+def _recv_exact(sock: socket.socket, n: int,
+                deadline: Optional[float] = None) -> Optional[bytes]:
     """Exactly ``n`` bytes, or None if the peer closed early."""
     buf = b""
     while len(buf) < n:
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise socket.timeout("SOCKS5 deadline expired")
+            sock.settimeout(left)
         chunk = sock.recv(n - len(buf))
         if not chunk:
             return None
@@ -258,42 +243,45 @@ def socks5_open(sock: socket.socket, host: str, port: int,
     """SOCKS5 CONNECT on a connected socket; "" on success, else a reason."""
     # one window
     window = sock.gettimeout()
-    deadline = (time.time() + window) if window else None
+    deadline = (time.monotonic() + window) if window else None
+
+    def send(data: bytes) -> None:
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise socket.timeout("SOCKS5 deadline expired")
+            sock.settimeout(left)
+        sock.sendall(data)
+
     try:
         if cred is None:
-            sock.sendall(bytes([0x05, 0x01, 0x00]))
-            resp = sock.recv(2)
-            if len(resp) != 2 or resp[0] != 0x05 or resp[1] != 0x00:
+            send(bytes([0x05, 0x01, 0x00]))
+            resp = _recv_exact(sock, 2, deadline)
+            if resp is None or resp[0] != 0x05 or resp[1] != 0x00:
                 return "bad SOCKS5 greeting"
         else:
             # both methods
-            sock.sendall(bytes([0x05, 0x02, 0x00, 0x02]))
-            resp = sock.recv(2)
-            if len(resp) != 2 or resp[0] != 0x05:
+            send(bytes([0x05, 0x02, 0x00, 0x02]))
+            resp = _recv_exact(sock, 2, deadline)
+            if resp is None or resp[0] != 0x05:
                 return "bad SOCKS5 greeting"
             if resp[1] == 0x02:
                 user, password = cred
                 ub = user.encode("utf-8")[:255]
                 pb = password.encode("utf-8")[:255]
-                sock.sendall(bytes([0x01, len(ub)]) + ub
-                             + bytes([len(pb)]) + pb)
-                auth = _recv_exact(sock, 2)
+                send(bytes([0x01, len(ub)]) + ub
+                     + bytes([len(pb)]) + pb)
+                auth = _recv_exact(sock, 2, deadline)
                 if auth is None or auth[0] != 0x01 or auth[1] != 0x00:
                     return "SOCKS5 auth refused"
             elif resp[1] != 0x00:
                 return "bad SOCKS5 greeting"
         # idna hosts
         addr = host.encode("idna")
-        sock.sendall(bytes([0x05, 0x01, 0x00, 0x03, len(addr)])
-                     + addr + struct.pack("!H", port))
-        if deadline is not None:
-            # remaining budget
-            left = deadline - time.time()
-            if left <= 0.0:
-                return "timed out"
-            sock.settimeout(left)
+        send(bytes([0x05, 0x01, 0x00, 0x03, len(addr)])
+             + addr + struct.pack("!H", port))
         # variable reply
-        head = _recv_exact(sock, 4)
+        head = _recv_exact(sock, 4, deadline)
         if head is None or head[0] != 0x05:
             return "bad SOCKS5 reply"
         if head[1] != 0x00:
@@ -302,7 +290,7 @@ def socks5_open(sock: socket.socket, host: str, port: int,
         if atyp == 0x01:
             rest = 4 + 2
         elif atyp == 0x03:
-            first = _recv_exact(sock, 1)
+            first = _recv_exact(sock, 1, deadline)
             if first is None:
                 return "bad SOCKS5 reply"
             rest = first[0] + 2
@@ -310,13 +298,15 @@ def socks5_open(sock: socket.socket, host: str, port: int,
             rest = 16 + 2
         else:
             return f"bad address type {atyp}"
-        if _recv_exact(sock, rest) is None:
+        if _recv_exact(sock, rest, deadline) is None:
             return "bad SOCKS5 reply"
         return ""
     except socket.timeout:
         return "timed out"
     except OSError as exc:
         return f"tcp: {type(exc).__name__}"
+    finally:
+        sock.settimeout(window)
 
 
 def https_via_socks(proxy_port: int, host: str, method: str, path: str,
