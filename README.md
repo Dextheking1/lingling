@@ -6,9 +6,10 @@ OpenCode gives away genuinely good models for free. The catch: they throttle
 you by IP, so right when the conversation gets good — bam, wall. Very rude.
 
 Lingling fixes this the fun way. It spins up a little kitchen of Tor exit
-lanes on your machine, each one a different country, and puts your requests
-on whichever lane is hot. One exit gets throttled? Cute. Your traffic is
-already on another one. You never see the limit. You just keep typing.
+lanes on your machine, each one a different country, and sends every request
+down **all** of them at once. The first answer takes it; the rest are cut
+before they say a word. One exit gets throttled? Cute. Four of them do, and
+you are answered by the fifth without ever noticing. You just keep typing.
 
 ```
 pip install lingling
@@ -42,17 +43,17 @@ and exits. A crashed session leaves nothing behind — the lock self-clears.
 ### "Sure, but how do I know it's not lying?"
 
 Fair. That's what the proof window is for. A second console pops up next to
-your editor and shows every single model call, live: which lane it rode,
-which country, which exit IP, what came back, how big, how fast.
+your editor and shows every single model call, live: which lanes raced it,
+which one answered, which country and exit IP, what came back, how big, how
+fast. A losing lane's 429 is shown too -- that is the pool working, not your
+call failing.
 
 ```
-13:52:55  #3.1  lane 2 {de} 185.220.100.243  ->  muse-spark-1.2-contributor-free
-13:53:00    | #3.1 200 81.4 KB in 2.7s  first 0.7s  event 1.1s  reused tunnel
-13:53:01  #4.1  lane 3 {nl} 192.42.116.113  ->  muse-spark-1.2-contributor-free
-13:53:03    | #4.1 200 79.6 KB in 2.6s  first 0.6s  event 1.0s  reused tunnel
-13:53:07    | #5.1 429 exit limited 146m -- moving lanes
-13:53:07  * lane 3 keeps hitting the limit -- moving to a new country {se}
-13:53:09  * 4 lanes busy at cap -- holding this request for a free lane
+14:19:24  #208.1  lanes 1,2,3,5,4 {us,nl,de,at,se}  ->  muse-spark-1.3-contributor-free
+14:19:24    | #208.1 lane 5 {at} 429 exit limited 911m -- moving lanes  0.1 KB in 7.4s
+14:19:25    | #208.1 lane 4 {se} 200 29.7 KB in 7.7s  first 5.8s  event 7.44s
+14:19:27  * lane 5 was refused (429) -- moved to {se}
+14:19:29    | #259.1 lane 5 {ca} 429 exit limited 911m -- moving lanes  0.1 KB in 2.9s
 ```
 
 No gaslighting. If the pane says bytes are flowing through a German exit,
@@ -61,7 +62,7 @@ your tokens are flowing through a German exit. `--no-proof` if you trust us.
 
 ### How a limit dies without you noticing
 
-Two different things can go wrong, and they are kept strictly apart.
+Four different things can go wrong, and they are kept strictly apart.
 
 **The limit.** opencode's free tier is per exit IP, and a 429 means that IP
 has spent its allowance for the window. opencode tells us exactly when it
@@ -71,18 +72,21 @@ country, and your request is already elsewhere. Keep hitting the limit and the
 lane changes country too; keep going and it gets re-cooked from scratch. The
 proof window names the reset it was told: `429 exit limited 146m`.
 
-**Busy.** A lane carrying as many requests as we allow is *busy* — loaded,
-healthy, still ours. Nothing is retired for it. Your request waits for a free
-lane instead, and the pane says so once: `4 lanes busy at cap`, or
-`no lane available` when the lanes are cooking rather than loaded. Busy is
-never confused with the limit, because retiring a healthy exit over it would
-be exactly the wrong move.
+**Load.** How much a lane is carrying decides where it sits in the race,
+never whether it keeps serving. A loaded lane is healthy and still ours, so
+nothing is retired for it — and nothing queues either, because the request
+already went out on every live lane at once. The quickest answer wins.
 
 **The far end's bad moments.** A 502, 503 or 504 means opencode's edge is
 unwell — not your client, and not that exit's quota. A different exit reaches
 a different edge, so those are retried on another lane exactly like a 429. A
 plain 500 is *not* retried: that may be a genuine error, and repeating it
 would just fail twice.
+
+**A slow exit.** If a lane makes your answer wait 20s for its first token, it
+is written off on the spot — the same treatment a 429 gets — and your next
+call rides elsewhere. Your current answer is never taken away for it: that
+verdict lands after the bytes were already yours.
 
 A Tor tunnel is end-to-end TLS, so a 429 can't be spotted in flight. Each lane
 therefore probes the upstream periodically and reports on itself, and a lane
@@ -166,8 +170,8 @@ we don't parse it, we don't want to know.
 lingling/cli.py      entry point, loader, opencode launch
 lingling/lanes.py    Tor lane lifecycle: boot, pin, rotate, re-cook
 lingling/exits.py    exit relays from the consensus: fresh, distinct, country-filtered
-lingling/relay.py    local CONNECT relay, least-loaded lane picking, MITM handoff
-lingling/mitm.py     local CA + per-request interception for opencode.ai
+lingling/relay.py    local CONNECT relay, lane ranking by load, MITM handoff
+lingling/mitm.py     local CA, interception, and one call raced over every lane
 lingling/health.py   probe daemon: limits, deaths, recoveries
 lingling/proof.py    the proof window (event log + live tail)
 lingling/netutil.py  raw SOCKS5 / HTTPS-over-SOCKS primitives
