@@ -45,36 +45,36 @@ import urllib.request
 from pathlib import Path
 from typing import Optional, Sequence
 
-#: The manifest endpoint (a Vercel function, see tools/update-api/). It
-#: carries human-controlled fields a plain release cannot: a one-line
-#: notice, and the oldest build still known to work against current
-#: opencode. A release is the only way to change *code*; this is the
-#: only way to say something urgent before the next release lands.
+"""The manifest endpoint (a Vercel function, see tools/update-api/). It
+carries human-controlled fields a plain release cannot: a one-line
+notice, and the oldest build still known to work against current
+opencode. A release is the only way to change *code*; this is the
+only way to say something urgent before the next release lands."""
 MANIFEST_URL = "https://lingling-update.vercel.app/api/latest"
 
-#: Fallback when the manifest is unreachable: the registry itself.
+"""Fallback when the manifest is unreachable: the registry itself."""
 PYPI_URL = "https://pypi.org/pypi/lingling/json"
 
-#: The manifest format this build understands. An unknown schema is
-#: ignored rather than guessed at, so a future field cannot make an old
-#: client misread a newer manifest.
+"""The manifest format this build understands. An unknown schema is
+ignored rather than guessed at, so a future field cannot make an old
+client misread a newer manifest."""
 SCHEMA = 1
 
-#: How long a good answer is trusted, and how long a bad one is.
+"""How long a good answer is trusted, and how long a bad one is."""
 CACHE_TTL = 6 * 3600
 FAIL_TTL = 3600
 
-#: Bound on each request. The check rides a boot that takes minutes, so
-#: a slow endpoint is only ever a late line, never a late launch.
+"""Bound on each request. The check rides a boot that takes minutes, so
+a slow endpoint is only ever a late line, never a late launch."""
 TIMEOUT = 3.0
 
-#: Bound on the whole check, so a pathological resolver cannot pin the
-#: thread past the point where the notice is worth printing.
+"""Bound on the whole check, so a pathological resolver cannot pin the
+thread past the point where the notice is worth printing."""
 BUDGET = 8.0
 
-#: How long the detached helper waits for us to exit before giving up.
-#: A session can legitimately run all day; after a day the upgrade is
-#: better left to the next launch than installed around a live kitchen.
+"""How long the detached helper waits for us to exit before giving up.
+A session can legitimately run all day; after a day the upgrade is
+better left to the next launch than installed around a live kitchen."""
 HELPER_WAIT = 24 * 3600
 
 CACHE_NAME = "update-check.json"
@@ -118,11 +118,11 @@ Nothing here is required: with the check off, lingling launches exactly
 as it did before this command existed.
 """
 
-#: The detached installer. It waits for the launcher that spawned it to
-#: die -- the file lock is on the running image, not on the package --
-#: and only then installs. ``os.kill(pid, 0)`` is deliberately not used:
-#: on Windows that call TERMINATES the process it is asked about, so the
-#: liveness check has to be the OS's own table.
+"""The detached installer. It waits for the launcher that spawned it to
+die -- the file lock is on the running image, not on the package --
+and only then installs. ``os.kill(pid, 0)`` is deliberately not used:
+on Windows that call TERMINATES the process it is asked about, so the
+liveness check has to be the OS's own table."""
 _HELPER = r'''
 import os, subprocess, sys, time
 
@@ -197,6 +197,26 @@ sys.exit(rc)
 # versions
 # ---------------------------------------------------------------------------
 
+def _version_text(value) -> Optional[str]:
+    """Accept only the release scheme the updater can compare safely."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if re.fullmatch(
+        r"[vV]?\d+\.\d+\.\d+(?:\.post\d+)?(?:\+[\w.-]+)?", value) else None
+
+
+def _safe_info(info: dict) -> dict:
+    """Normalize manifest and cache fields at the trust boundary."""
+    result = dict(info)
+    for name in ("latest", "min_supported"):
+        result[name] = _version_text(info.get(name))
+    for name in ("notice", "url", "source"):
+        value = info.get(name)
+        result[name] = value.strip() if isinstance(value, str) else None
+    return result
+
+
 def key(version: str) -> tuple:
     """An ordering key for lingling's own scheme: ``X.Y.Z[.postN]``.
 
@@ -207,7 +227,10 @@ def key(version: str) -> tuple:
     ``X.Y.Z``. Anything unparseable reads as zero, so a junk tag can
     never outrank a real release.
     """
-    text = (version or "").strip().lstrip("vV").split("+", 1)[0].strip()
+    text = _version_text(version)
+    if text is None:
+        return (0, 0, 0, 0, 0)
+    text = text.lstrip("vV").split("+", 1)[0]
     post = 0
     if ".post" in text:
         text, _, tail = text.partition(".post")
@@ -223,7 +246,7 @@ def key(version: str) -> tuple:
 
 def is_newer(candidate: Optional[str], than: str) -> bool:
     """True when ``candidate`` sorts after ``than`` under :func:`key`."""
-    if not candidate or not than:
+    if _version_text(candidate) is None or _version_text(than) is None:
         return False
     return key(candidate) > key(than)
 
@@ -288,7 +311,8 @@ def _get_json(url: str, timeout: float):
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
-    except Exception:  # noqa: BLE001 -- offline, DNS, TLS, junk body, anything
+    except Exception:  # noqa: BLE001
+        """offline, DNS, TLS, junk body, anything"""
         return None
 
 
@@ -303,16 +327,19 @@ def _lookup(timeout: float) -> dict:
         info["min_supported"] = doc.get("min_supported") or None
         info["notice"] = doc.get("notice") or None
         info["url"] = doc.get("url") or None
+        info = _safe_info(info)
         if info["latest"] or info["notice"]:
             info["source"] = "manifest"
             if info["latest"]:
                 return info
-    # A manifest that is unreachable, or a schema we do not understand,
-    # still leaves the registry -- which is the version users get when
-    # they follow the install line in the README anyway.
+    """A manifest that is unreachable, or a schema we do not understand,
+    still leaves the registry -- which is the version users get when
+    they follow the install line in the README anyway."""
     doc = _get_json(PYPI_URL, timeout)
     if isinstance(doc, dict):
-        latest = ((doc.get("info") or {}).get("version")) or None
+        registry = doc.get("info")
+        latest = _version_text(registry.get("version")) \
+            if isinstance(registry, dict) else None
         if latest:
             info["latest"] = latest
             info["source"] = "pypi"
@@ -327,9 +354,10 @@ def read_cache(data_dir) -> Optional[dict]:
     """The last answer, or None. No network, no side effects."""
     try:
         doc = json.loads(_cache_path(data_dir).read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001 -- missing, unreadable, truncated
+    except Exception:  # noqa: BLE001
+        """missing, unreadable, truncated"""
         return None
-    return doc if isinstance(doc, dict) else None
+    return _safe_info(doc) if isinstance(doc, dict) else None
 
 
 def _write_cache(data_dir, info: dict) -> None:
@@ -377,6 +405,7 @@ def behind(info: Optional[dict], current: Optional[str] = None) -> bool:
     """Should this build be asking the user to move? """
     if not isinstance(info, dict):
         return False
+    info = _safe_info(info)
     current = current or current_version()
     if is_newer(info.get("latest"), current):
         return True
@@ -401,6 +430,7 @@ def notice_lines(info: Optional[dict], current: Optional[str] = None,
     """
     if mode_name == "off" or not behind(info, current):
         return []
+    info = _safe_info(info)
     current = current or current_version()
     latest = info.get("latest")
     lines = []
@@ -429,7 +459,7 @@ def notice_lines(info: Optional[dict], current: Optional[str] = None,
 
 
 # ---------------------------------------------------------------------------
-# the launch-side check
+"""the launch-side check"""
 # ---------------------------------------------------------------------------
 
 class Check:
@@ -451,10 +481,10 @@ class Check:
         def run() -> None:
             deadline = time.time() + BUDGET
             try:
-                # Housekeeping for a previous upgrade, off the boot path:
-                # a launcher parked by an earlier install is still locked
-                # until the process owning it exits, so the sweep belongs
-                # to the next launch rather than the one that parked it.
+                """Housekeeping for a previous upgrade, off the boot path:
+                a launcher parked by an earlier install is still locked
+                until the process owning it exits, so the sweep belongs
+                to the next launch rather than the one that parked it."""
                 sweep_launcher_leftovers()
                 cached = read_cache(data_dir)
                 if fresh(cached):
@@ -483,7 +513,8 @@ def start(data_dir) -> Optional[Check]:
         return None
     try:
         return Check().start(data_dir)
-    except Exception:  # noqa: BLE001 -- a thread that will not start is not a launch failure
+    except Exception:  # noqa: BLE001
+        """a thread that will not start is not a launch failure"""
         return None
 
 
@@ -661,17 +692,17 @@ def run_install(capture: bool = False, timeout: float = 600):
 
     if parked is not None:
         if launcher.exists():
-            # An installer that wrote a fresh launcher has already done the
-            # thing this parking existed for, so the parked one is dead
-            # weight. Deleting it can still fail while it is the running
-            # image; that is what the next launch's sweep is for.
+            """An installer that wrote a fresh launcher has already done the
+            thing this parking existed for, so the parked one is dead
+            weight. Deleting it can still fail while it is the running
+            image; that is what the next launch's sweep is for."""
             try:
                 parked.unlink()
             except OSError:
                 pass
         else:
-            # Put it back, so a failed install is a no-op rather than a
-            # machine where `lingling` no longer exists.
+            """Put it back, so a failed install is a no-op rather than a
+            machine where `lingling` no longer exists."""
             try:
                 os.replace(parked, launcher)
             except OSError:
@@ -691,7 +722,8 @@ def installed_version() -> Optional[str]:
     try:
         from importlib.metadata import version as _v
         return _v("lingling")
-    except Exception:  # noqa: BLE001 -- not installed as a distribution
+    except Exception:  # noqa: BLE001
+        """not installed as a distribution"""
         return None
 
 
@@ -722,19 +754,19 @@ def helper_python() -> str:
     return sys.executable or "python"
 
 
-#: CreateProcess flags for the detached installer.
+"""CreateProcess flags for the detached installer."""
 #:
-#: DETACHED_PROCESS gives it no console, CREATE_NEW_PROCESS_GROUP keeps a
-#: Ctrl+C in the session from reaching it, and CREATE_BREAKAWAY_FROM_JOB is
-#: the one that actually matters. lingling joins a KILL_ON_JOB_CLOSE job as
-#: soon as its first lane starts (``winjob.ensure_kill_job``), and Windows
-#: drags every child of a job member into that job whether the child asks or
-#: not -- so without breakaway the helper is terminated at the instant
-#: lingling exits, which is exactly when it is supposed to run pip. The
-#: install then silently never happens, while the log still cheerfully says
-#: it was scheduled. Breakaway requires the job to permit it, which is why
-#: ``winjob`` sets JOB_OBJECT_LIMIT_BREAKAWAY_OK; a third-party job that
-#: forbids it rejects this spawn outright, and the retry below covers that.
+"""DETACHED_PROCESS gives it no console, CREATE_NEW_PROCESS_GROUP keeps a
+Ctrl+C in the session from reaching it, and CREATE_BREAKAWAY_FROM_JOB is
+the one that actually matters. lingling joins a KILL_ON_JOB_CLOSE job as
+soon as its first lane starts (``winjob.ensure_kill_job``), and Windows
+drags every child of a job member into that job whether the child asks or
+not -- so without breakaway the helper is terminated at the instant
+lingling exits, which is exactly when it is supposed to run pip. The
+install then silently never happens, while the log still cheerfully says
+it was scheduled. Breakaway requires the job to permit it, which is why
+``winjob`` sets JOB_OBJECT_LIMIT_BREAKAWAY_OK; a third-party job that
+forbids it rejects this spawn outright, and the retry below covers that."""
 _DETACHED = 0x00000008
 _NEW_GROUP = 0x00000200
 _BREAKAWAY = 0x01000000
@@ -781,7 +813,8 @@ def spawn_deferred(data_dir, delay: Optional[float] = None):
                 stderr=subprocess.STDOUT, close_fds=True, env=env,
                 **_detach_kwargs(breakaway))
             break
-        except Exception:  # noqa: BLE001 -- a job may forbid breakaway
+        except Exception:  # noqa: BLE001
+            """a job may forbid breakaway"""
             proc = None
     if proc is None:
         try:
@@ -803,20 +836,20 @@ def spawn_deferred(data_dir, delay: Optional[float] = None):
 # the question
 # ---------------------------------------------------------------------------
 
-#: The question, asked at the handoff when an update is waiting and there
-#: is a terminal to ask on. Enter installs, which is also what the
-#: unattended path does -- so the default never strands a user on a
-#: question they did not expect, and never costs them a version either.
+"""The question, asked at the handoff when an update is waiting and there
+is a terminal to ask on. Enter installs, which is also what the
+unattended path does -- so the default never strands a user on a
+question they did not expect, and never costs them a version either."""
 PROMPT = "  install it when this session ends? [Y/n] "
 
-#: What a ``no`` says. One line, and it names both ways to get the
-#: install later -- otherwise "skipped" reads as "never", and the next
-#: launch asks again with no way to make it stop.
+"""What a ``no`` says. One line, and it names both ways to get the
+install later -- otherwise "skipped" reads as "never", and the next
+launch asks again with no way to make it stop."""
 SKIP_LINE = ("  ok -- skipped: `lingling update` installs it when you want, "
              "and LINGLING_UPDATE=notify stops the question")
 
 
-#: A ``no``, in the shapes a person actually types.
+"""A ``no``, in the shapes a person actually types."""
 _NO = ("n", "no")
 
 
@@ -838,7 +871,8 @@ def _console_stdin() -> bool:
         kernel32 = ctypes.windll.kernel32
         return bool(kernel32.GetConsoleMode(
             kernel32.GetStdHandle(-10), ctypes.byref(ctypes.c_uint())))
-    except Exception:  # noqa: BLE001 -- no ctypes, no console, no question
+    except Exception:  # noqa: BLE001
+        """no ctypes, no console, no question"""
         return False
 
 
@@ -861,7 +895,8 @@ def _at_terminal(stdout=None) -> bool:
         if os.name == "nt":
             return _console_stdin()
         return bool(sys.stdin.isatty())
-    except Exception:  # noqa: BLE001 -- a stream with no isatty at all
+    except Exception:  # noqa: BLE001
+        """a stream with no isatty at all"""
         return False
 
 
@@ -881,7 +916,8 @@ def _pending_input() -> bool:
             return bool(msvcrt.kbhit())
         import select
         return bool(select.select([sys.stdin], [], [], 0)[0])
-    except Exception:  # noqa: BLE001 -- no console to ask
+    except Exception:  # noqa: BLE001
+        """no console to ask"""
         return True
 
 
@@ -908,7 +944,8 @@ def _ask(prompt: str, stream) -> str:
     try:
         stream.write(prompt)
         stream.flush()
-    except Exception:  # noqa: BLE001 -- nowhere to ask means no
+    except Exception:  # noqa: BLE001
+        """nowhere to ask means no"""
         return "n"
     try:
         return input()
@@ -941,7 +978,7 @@ def auto_install(data_dir, info: Optional[dict], ask: bool = False,
 
 
 # ---------------------------------------------------------------------------
-# the explicit command
+"""the explicit command"""
 # ---------------------------------------------------------------------------
 
 def _report(current: str, info: dict, stream=None) -> None:
@@ -966,9 +1003,9 @@ def update_command(rest: Sequence[str]) -> int:
     if "--help" in args or "-h" in args:
         print(UPDATE_HELP)
         return 0
-    # Cheap housekeeping, and the right moment for it: a launcher parked by
-    # an earlier `--now` was locked by the process that parked it, so this
-    # run is the first that can actually delete it.
+    """Cheap housekeeping, and the right moment for it: a launcher parked by
+    an earlier `--now` was locked by the process that parked it, so this
+    run is the first that can actually delete it."""
     sweep_launcher_leftovers()
     check_only = "--check" in args
     now = "--now" in args
@@ -980,8 +1017,8 @@ def update_command(rest: Sequence[str]) -> int:
     _report(current, info)
 
     if not info.get("latest"):
-        # Silence is right on a launch and a lie in an explicit command:
-        # "nothing to do" must never stand in for "I could not look".
+        """Silence is right on a launch and a lie in an explicit command:
+        "nothing to do" must never stand in for "I could not look"."""
         print("  could not reach the update servers -- nothing was changed.")
         print("  install by hand:  " + " ".join(upgrade_command()))
         return 1
