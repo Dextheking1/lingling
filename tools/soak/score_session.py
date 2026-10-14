@@ -50,7 +50,10 @@ def requests(evs: list, lo: float, hi: float) -> dict:
     host = {}
     for e in evs:
         if e.get("type") == "call" and lo <= e["t"] < hi:
-            host[(e["n"], e["c"], e["lane"])] = e.get("host", "?")
+            # a raced call goes out on every lane it names, and the answer
+            # comes back on one of them
+            for lane in (e.get("lanes") or [e["lane"]]):
+                host[(e["n"], e["c"], lane)] = e.get("host", "?")
     groups = collections.defaultdict(list)
     for e in evs:
         if e.get("type") != "callend" or not (lo <= e["t"] < hi):

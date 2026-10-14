@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from lingling import mitm, proof
+from lingling import cli, mitm, netutil, proof
 from lingling.cli import DATA_DIR, load_countries
 from lingling.health import HealthDaemon
 from lingling.lanes import TorManager
@@ -45,7 +45,8 @@ HARD_PROMPTS = [
     "Prove that every finite integral domain is a field, then explain where "
     "the argument breaks for infinite domains.",
     "Write a correct LRU cache in Python with O(1) operations, then prove "
-    "the amortised bound of each method.",
+    "the amortised bound of each method. Answer in your reply only; do not "
+    "create or edit any files.",
     "Explain why TCP congestion control converges, deriving the AIMD "
     "equilibrium from first principles and noting the assumptions.",
     "Given a stream of integers, design a structure returning the median in "
@@ -97,7 +98,8 @@ class LogTail:
 
     def __init__(self, path):
         self.path = path
-        self.off = path.stat().st_size if path.exists() else 0
+        self.start_off = path.stat().st_size if path.exists() else 0
+        self.off = self.start_off
         self.buf = b""
         self.calls = 0
         self.call_lanes = []
@@ -129,7 +131,8 @@ class LogTail:
             t = r.get("type")
             if t == "call":
                 self.calls += 1
-                self.call_lanes.append(r.get("lane"))
+                # a raced call names every lane it went out on
+                self.call_lanes.extend(r.get("lanes") or [r.get("lane")])
             elif t == "callend":
                 self.ends.append(r)
             elif t == "lane":
@@ -145,20 +148,99 @@ def kill_tree(pid):
         pass
 
 
+class Killer:
+    """One hard kill, mid-soak: the revive path, exercised on every run.
+
+    A tor that dies while the session is up used to leave nothing behind --
+    no revive, no line in the pane, and a lane that never served again.
+    Killing one on purpose is how a soak proves that path still works, with
+    nobody watching.
+    """
+
+    # The kill has to land well inside the run: a soak that reaches its
+    # target in under a minute never fired it at 60s, so the revive path
+    # went untested in exactly the short, fast runs.
+    def __init__(self, mgr, lane_index=2, at_s=12.0):
+        self.mgr = mgr
+        self.lane_index = lane_index
+        self.at_s = at_s
+        self.fired = False
+        self.result = "not fired"
+
+    def maybe(self, elapsed):
+        if self.fired or elapsed < self.at_s:
+            return
+        self.fired = True
+        lane = next((l for l in self.mgr.lanes if l.index == self.lane_index),
+                    None)
+        if lane is None:
+            self.result = f"no lane {self.lane_index}"
+            return
+        held = netutil.pids_on_ports({lane.socks_port, lane.control_port})
+        pid = held.get(lane.socks_port) or held.get(lane.control_port) or 0
+        if not pid:
+            self.result = f"lane {lane.index} had no tor listening"
+            return
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=15)
+        except Exception as exc:  # noqa: BLE001
+            self.result = f"kill failed: {type(exc).__name__}"
+            return
+        self.result = (f"killed tor pid {pid} on lane {lane.index} at "
+                       f"{elapsed:.0f}s")
+        print(f"[soak] {self.result}", flush=True)
+
+
+def warmup(oc, env, timeout=150.0):
+    """One proxied model call, so the load never measures a cold server.
+
+    Returns the first status the relay saw, or the failure in words. A
+    server that has just been restarted refuses the first calls with 403
+    for about ten seconds; the pool is not involved in that at all.
+    """
+    spec = "opencode/" + MODEL
+    spec += "#" + os.environ.get("SOAK_VARIANT", "high")
+    mark = LogTail(PROOF_LOG)
+    try:
+        subprocess.run([oc, "run", "-m", spec, "Reply with exactly: OK"],
+                       env=env, capture_output=True, timeout=timeout,
+                       text=True, encoding="utf-8", errors="replace",
+                       cwd=str(Path.home()))
+    except Exception as exc:  # noqa: BLE001
+        return f"raised {type(exc).__name__}"
+    deadline = time.monotonic() + 40
+    while time.monotonic() < deadline:
+        mark.poll()
+        if mark.calls:
+            break
+        time.sleep(1)
+    statuses = [str(e.get("status")) for e in mark.ends]
+    return ",".join(statuses) if statuses else "no model call reached the relay"
+
+
 def run_once(oc, env, i, pool=None):
     t0 = time.monotonic()
     prompts = pool or PROMPTS
     prompt = prompts[i % len(prompts)]
     hard = prompts is HARD_PROMPTS
     try:
-        cmd = [oc, "run", "-m", "opencode/" + MODEL]
+        # The effort rides the MODEL string: opencode's `-m` is
+        # `provider/model#variant`, and `opencode run` has no --variant flag,
+        # so asking for it as a flag made every hard run exit before a
+        # single model call.
+        spec = "opencode/" + MODEL
         if hard:
-            # Ask for the effort the owner's failing calls
-            cmd += ["--variant", os.environ.get("SOAK_VARIANT", "high")]
+            spec += "#" + os.environ.get("SOAK_VARIANT", "high")
+        cmd = [oc, "run", "-m", spec]
         cmd.append(prompt)
+        # opencode's output is UTF-8: `text=True` alone decodes it as cp1252
+        # on Windows and the reader thread dies on the first box character,
+        # which killed every run before its model call could be logged.
         proc = subprocess.Popen(
             cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, cwd=str(Path.home()))
+            text=True, encoding="utf-8", errors="replace",
+            cwd=str(Path.home()))
     except Exception as exc:  # noqa: BLE001
         return i, -2, time.monotonic() - t0, type(exc).__name__
     try:
@@ -172,6 +254,9 @@ def run_once(oc, env, i, pool=None):
 def main():
     argv = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    #: created before the boot, so one reader owns the whole run: the launch
+    #: lines, the warm-up, the load and every lane event in between.
+    tail = LogTail(PROOF_LOG)
     target = int(argv[0]) if argv else 400
     conc = int(os.environ.get("SOAK_CONCURRENCY", "5"))
     budget = float(os.environ.get("SOAK_BUDGET_S", "2700"))
@@ -191,10 +276,31 @@ def main():
     env["HTTP_PROXY"] = f"http://127.0.0.1:{port}"
     env["NO_PROXY"] = "localhost,127.0.0.1"
     env["NODE_EXTRA_CA_CERTS"] = ca
+    """From opencode 2.0.26 the call is made by a background server that
+    keeps the environment it was born with, so a proxy handed to the client
+    never reaches the model. This is the product's own handoff: the server
+    is restarted under our environment, and stopped again on the way out so
+    no server is left holding a relay port that no longer exists."""
+    server = cli._uses_background_server(oc)
+    if server:
+        cli._server(oc, env, "restart")
 
-    tail = LogTail(PROOF_LOG)
+    """A server restarted under the proxy answers its first model calls
+    with 403 ("the free tier can only be used from within OpenCode") until
+    it is warm -- measured: 34 of 34 calls refused between 7s and 17s after
+    a restart, none after. That is the server's own startup, not the pool,
+    so one call is sent and waited out before the load begins."""
+    warm = warmup(oc, env)
+    print(f"[soak] first call after the restart: {warm}", flush=True)
+
+    killer = None
+    if "--kill" in flags:
+        killer = Killer(mgr, int(os.environ.get("SOAK_KILL_LANE", "2")),
+                        float(os.environ.get("SOAK_KILL_AT", "12")))
     print(f"[soak] target={target} model calls  concurrency={conc}  "
-          f"budget={budget:.0f}s", flush=True)
+          f"budget={budget:.0f}s"
+          + (f"  hard-kill lane {killer.lane_index} at {killer.at_s:.0f}s"
+             if killer else ""), flush=True)
     t0 = time.monotonic()
     results = []
     runs = 0
@@ -203,6 +309,8 @@ def main():
         while True:
             elapsed = time.monotonic() - t0
             tail.poll()
+            if killer is not None:
+                killer.maybe(elapsed)
             if tail.calls >= target:
                 print(f"[soak] target reached: {tail.calls} calls", flush=True)
                 break
@@ -293,6 +401,8 @@ def main():
         if e.get("kind") in ("limited", "rotate", "up", "fail", "probe"):
             print(f"  [{e.get('kind')}] {e.get('msg')}", flush=True)
 
+    if server:
+        cli._server(oc, env, "stop")
     daemon.stop()
     relay.stop()
     mgr.stop_all()
@@ -307,6 +417,46 @@ def main():
         print("           ^ a straggler survived stop_all -- it will block a "
               "lane next run", flush=True)
 
+    """The soak judges itself.
+
+    Counters alone let a silent failure through, and a silent failure is
+    what cost four lanes a whole session: nothing in the pane said they
+    were gone. These checks fail the run instead of leaving it to a reader.
+    """
+    print("\n--- verdict ---", flush=True)
+    try:
+        text = PROOF_LOG.read_bytes()[tail.start_off:].decode(
+            "utf-8", "replace")
+    except OSError:
+        text = ""
+    tracebacks = text.count("Traceback")
+    used = {l for l in tail.call_lanes if l}
+    spoken = {e.get("lane") for e in tail.lanes}
+    silent = sorted(used - spoken)
+    fails = [e for e in tail.lanes if e.get("kind") == "fail"]
+    checks = [
+        ("no traceback in the run", tracebacks == 0, f"{tracebacks} found"),
+        ("every lane that carried a call is reported on", not silent,
+         f"lanes {silent} served traffic and said nothing"),
+        ("no lane failure went unexplained", not fails,
+         "; ".join(str(e.get("msg")) for e in fails[:3]) or "none"),
+        ("no tor survived the session", not _tor, f"{len(_tor)} left"),
+    ]
+    if killer is not None:
+        revived = [e.get("msg") for e in tail.lanes
+                   if "brought it back" in (e.get("msg") or "")]
+        checks.append(("a killed lane came back", bool(revived),
+                       killer.result + " -> "
+                       + ("; ".join(revived) or "no revive in the pane")))
+    failed = 0
+    for name, ok, detail in checks:
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}   ({detail})",
+              flush=True)
+        failed += not ok
+    print(f"\nSOAK {'FAILED' if failed else 'PASSED'}: "
+          f"{len(checks) - failed}/{len(checks)} checks", flush=True)
+    return 1 if failed else 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
