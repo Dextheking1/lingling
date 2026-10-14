@@ -261,6 +261,235 @@ def _grab_lane(relay, tried: set):
     return relay.pick_lane(exclude=tried)
 
 
+def _race_lanes(relay, tried: set) -> List[Lane]:
+    """Every lane that can still serve this call, the favorite first.
+
+    Racing all of them is the point: a request used to ride one lane and
+    wait behind that lane's queue while the other four sat idle.
+    """
+    lanes: List[Lane] = []
+    taken = set(tried)
+    first = _grab_lane(relay, taken)
+    if first is not None:
+        lanes.append(first)
+        taken.add(first.index)
+    while True:
+        lane = relay.pick_lane(exclude=taken)
+        if lane is None or lane.index in taken:
+            break
+        taken.add(lane.index)
+        if lane.limited_until > time.time():
+            """Burnt: leave it out, and keep looking for a live lane."""
+            continue
+        lanes.append(lane)
+    return lanes
+
+
+class _Copy:
+    """One lane's go at one call: cuttable from the thread that won."""
+
+    def __init__(self, lane: Lane) -> None:
+        self.lane = lane
+        self.race: Optional[_Race] = None
+        self.thread: Optional[threading.Thread] = None
+        self.sock = None
+        self.beaten = False
+        self._lock = threading.Lock()
+
+    def arm(self, sock) -> bool:
+        """Hand over the socket to cut on a loss; False once beaten."""
+        with self._lock:
+            if self.beaten:
+                return False
+            self.sock = sock
+            return True
+
+    def beat(self) -> None:
+        """Another copy has the client: cut this upstream, and stop it."""
+        with self._lock:
+            self.beaten = True
+            sock, self.sock = self.sock, None
+        if sock is not None:
+            _abort_quiet(sock)
+
+    def stands(self) -> bool:
+        """True while this copy may still speak for itself, or charge."""
+        return self.race is not None and self.race.speak(self)
+
+    def owns(self) -> bool:
+        """True once this copy is the one that took the client."""
+        return self.race is not None and self.race.winner is self
+
+    def claim(self) -> bool:
+        """Take the client for this copy, or lose to one already there."""
+        return self.race is None or self.race.claim(self)
+
+
+class _Beaten(Exception):
+    """A copy that lost, raised where it would have written to the client."""
+
+
+class _Race:
+    """One call over every lane: the first answer to commit takes the client.
+
+    Nothing reaches the client until a copy commits, so a loser is cut
+    before it says a word -- and a loser is never a verdict about its lane,
+    because a hand of ours closed it.
+    """
+
+    def __init__(self, copies: List[_Copy]) -> None:
+        self.copies = copies
+        self.winner: Optional[_Copy] = None
+        self._lock = threading.Lock()
+        for copy in copies:
+            copy.race = self
+
+    def speak(self, copy: _Copy) -> bool:
+        """A copy may speak until one wins, and after that only the winner."""
+        with self._lock:
+            return self.winner is None or self.winner is copy
+
+    def claim(self, copy: _Copy) -> bool:
+        """Take the client for this copy, or lose to one already there."""
+        with self._lock:
+            if self.winner is None:
+                self.winner = copy
+                others = [c for c in self.copies if c is not copy]
+            elif self.winner is copy:
+                return True
+            else:
+                return False
+        for other in others:
+            try:
+                other.beat()
+            except Exception:  # noqa: BLE001
+                """Cutting a loser is housekeeping: a loser that cannot be
+                cut must never cost the winner the client."""
+        return True
+
+    def raced(self) -> int:
+        """How many lanes this call went out on."""
+        return len(self.copies)
+
+
+class _Round:
+    """What one race came back with: the client's answer, or the reason."""
+
+    def __init__(self) -> None:
+        self.committed = False
+        self.held = b""
+        self.retryable = False
+        self.limits: List[tuple] = []
+        self.refused = False
+        self.fivexx = False
+
+
+def _race_call(client, lanes: List[Lane], host: str, port: int, method: str,
+               path: str, headers: dict, body: bytes, emit, seq: int,
+               call_n: int, t0: float, relay, model: str = "") -> _Round:
+    """Fire one call at every lane at once; the first answer takes the client.
+
+    The copies only talk to the pane through the race, so a loser is
+    silent. A dead exit is charged once per call -- by the first copy, or
+    by the copy that won and then had its own stream cut.
+    """
+    copies = [_Copy(lane) for lane in lanes]
+    race = _Race(copies)
+    plain = len(lanes) == 1
+    emit({
+        "type": "call", "t": t0, "n": seq, "c": call_n,
+        "lane": lanes[0].index if plain else 0,
+        "cc": lanes[0].exit_country if plain else "",
+        "ip": lanes[0].exit_ip if plain else "",
+        "lanes": [l.index for l in lanes],
+        "ccs": [l.exit_country for l in lanes],
+        "method": method, "path": path, "model": model, "host": host,
+        # request size
+        "bytes": len(body),
+    })
+    out: List[tuple] = []
+    lock = threading.Lock()
+
+    def run(copy: _Copy) -> None:
+        def say(ev: Dict) -> None:
+            """A copy that lost has nothing to say in the pane."""
+            if race.speak(copy):
+                emit(ev)
+        got = _roundtrip(client, copy.lane, host, port, method, path,
+                         headers, body, say, seq, call_n, t0, relay,
+                         charge_timeout=copy is copies[0], model=model,
+                         copy=copy)
+        with lock:
+            out.append((copy, got))
+
+    for copy in copies:
+        with copy.lane.lock:
+            copy.lane.active += 1
+    threads = [threading.Thread(target=run, args=(c,), daemon=True,
+                                name=f"race-{seq}-{c.lane.index}")
+               for c in copies]
+    for copy, thread in zip(copies, threads):
+        copy.thread = thread
+        thread.start()
+    try:
+        """A round ends when a copy wins, or when every copy has given up.
+        Only the winner is waited on to the end; a loser is cut loose, and
+        a copy still dialling is left to notice on its own."""
+        while race.winner is None and any(t.is_alive() for t in threads):
+            time.sleep(0.05)
+        winner = race.winner
+        if winner is None:
+            for thread in threads:
+                thread.join()
+        else:
+            winner.thread.join()
+            for thread in threads:
+                if thread is not winner.thread:
+                    thread.join(timeout=1.0)
+    finally:
+        for copy in copies:
+            with copy.lane.lock:
+                copy.lane.active -= 1
+    return _tally(race, out, relay)
+
+
+def _tally(race: _Race, out: List[tuple], relay) -> _Round:
+    """Judge a race: the client's answer, or what the copies earned."""
+    got = _Round()
+    for copy, (err, status, body, retryable) in out:
+        if race.winner is copy:
+            """The copy that reached the client: score the exit it rode."""
+            relay.tor.note_result(copy.lane.exit_country, status)
+            continue
+        if err:
+            if copy.beaten:
+                """A hand of ours cut it: never a verdict, never a retry."""
+                continue
+            got.retryable = got.retryable or retryable
+            continue
+        if status == 429:
+            limit, wait = _limit_of(body)
+            if limit:
+                got.limits.append((copy.lane, wait))
+                got.retryable = True
+                if not got.held:
+                    got.held = body
+                continue
+            """The far end's own 429: no lane will do better at all."""
+            got.refused = True
+            got.held = body
+            continue
+        if status in _RETRYABLE:
+            got.fivexx = True
+            got.retryable = True
+            if not got.held:
+                got.held = body
+    """The copy that claimed owns the client, even when its own outcome
+    never came back: a second round would answer one request twice."""
+    got.committed = race.winner is not None
+    return got
+
+
 def _sticky_ceiling(relay, lane) -> float:
     """While stuck on a lane, its release ceiling replaces the slow one."""
     sticky = getattr(relay.tor, "sticky", None)
@@ -393,9 +622,9 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
         tried = set()
         bad5xx = 0
         while True:
-            # spread load
-            lane = _grab_lane(relay, tried)
-            if lane is None:
+            """Every lane at once: the first answer takes the client."""
+            lanes = _race_lanes(relay, tried)
+            if not lanes:
                 # last body
                 if held:
                     client.sendall(held)
@@ -403,65 +632,43 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
                     client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n"
                                    b"Content-Length: 0\r\n\r\n")
                 return
-            t0 = time.time()
-            emit({
-                "type": "call", "t": t0, "n": seq, "c": call_n,
-                "lane": lane.index, "cc": lane.exit_country,
-                "ip": lane.exit_ip,
-                "method": method, "path": path, "model": model, "host": host,
-                # request size
-                "bytes": len(body),
-            })
-            with lane.lock:
-                lane.active += 1
-            try:
-                err, status, got_held, retryable = _roundtrip(
-                    client, lane, host, port, method, path, headers,
-                    body, emit, seq, call_n, t0, relay,
-                    # only once
-                    charge_timeout=not tried,
-                    model=model)
-            finally:
-                with lane.lock:
-                    lane.active -= 1
-            if got_held:
+            tried.update(l.index for l in lanes)
+            got = _race_call(client, lanes, host, port, method, path, headers,
+                             body, emit, seq, call_n, time.time(), relay,
+                             model)
+            for lane, wait in got.limits:
+                # burnt here
+                relay.tor.note_limited(lane, wait)
+                relay.report_refused(lane, 429)
+                _sticky_verdict(relay, lane)
+            if got.held:
                 # freshest verdict
-                held = got_held
-            if err:
-                # free retry
-                if retryable:
-                    tried.add(lane.index)
-                    continue
+                held = got.held
+            if got.committed:
+                """The client has its answer; the winner is streaming it."""
                 return
-            if status in _RETRYABLE:
-                if status == 429:
-                    exit_limit, retry_after = _limit_of(held)
-                    if not exit_limit:
-                        """opencode is down, not the exit: moving cannot help"""
-                        client.sendall(held)
-                        return
-                    relay.tor.note_limited(lane, retry_after)
-                    relay.report_refused(lane, status)
-                    _sticky_verdict(relay, lane)
-                    tried.add(lane.index)
-                    if not relay.any_unlimited(tried):
-                        # none left
-                        if held:
-                            client.sendall(held)
-                        return
-                    continue
+            if got.refused:
+                """opencode is down, not the exit: moving cannot help"""
+                client.sendall(held)
+                return
+            if got.limits and not relay.any_unlimited(tried):
+                # none left
+                if held:
+                    client.sendall(held)
+                return
+            if got.fivexx:
                 # far edge
-                tried.add(lane.index)
                 bad5xx += 1
                 if bad5xx >= _5XX_ATTEMPTS:
                     # last verdict
                     if held:
                         client.sendall(held)
                     return
-                continue
-            # score it
-            relay.tor.note_result(lane.exit_country, status)
-            break
+            if not got.retryable:
+                """Nothing left to say: the connection is the failure."""
+                return
+            # free retry
+            continue
 
 
 def _close_quiet(sock) -> None:
@@ -470,6 +677,15 @@ def _close_quiet(sock) -> None:
         sock.close()
     except OSError:
         pass
+
+
+def _abort_quiet(sock) -> None:
+    """Cut a connection loose, so a read blocked on it lets go at once."""
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except (OSError, AttributeError):
+        pass
+    _close_quiet(sock)
 
 
 def _peer_closed(sock) -> bool:
@@ -564,9 +780,16 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                method: str, path: str, headers: dict, body: bytes,
                emit, seq: int, call_n: int, t0: float, relay: "object",
                charge_timeout: bool = False,
-               model: Optional[str] = None
+               model: Optional[str] = None, copy: Optional[_Copy] = None
                ) -> "tuple[str, int, bytes, bool]":
-    """One upstream attempt; 429s buffer into ``held`` for a lane retry."""
+    """One upstream attempt; 429s buffer into ``held`` for a lane retry.
+
+    With a ``copy``, this is one lane's go in a race: it claims the client
+    at its first content byte, and loses silently to a faster lane.
+    """
+    if copy is not None and copy.beaten:
+        """A lane that answered first has the client: nothing to dial for."""
+        return "", 0, b"", False
     if model is None:
         # model calls
         model = _model_of(body) if body else ""
@@ -582,17 +805,36 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
     status = 0             # upstream status
     pool = getattr(relay, "tunnels", None)
 
+    def _may() -> bool:
+        """True while this copy may still charge its lane: unbeaten, or won."""
+        return copy is None or copy.stands()
+
+    def _witness() -> bool:
+        """True when this copy's lane carries this call's dead-exit verdict.
+
+        The first copy speaks for a pool-wide failure, so one dead pool
+        cannot retire six exits; the copy that won and then lost its own
+        stream is the only voice left for that exit.
+        """
+        return charge_timeout or (copy is not None and copy.owns())
+
     def _keys() -> Dict:
         """The keys every callend carries, in one place."""
         return {**_lat(t0, first_byte_at, first_event_at),
                 "send_s": round(send_wait, 1),
                 "peer_close": peer_close,
-                "client_kb": round(sent / 1024, 1)}
+                "client_kb": round(sent / 1024, 1),
+                "raced": copy.race.raced() if copy is not None
+                and copy.race is not None else 0}
 
     kept = pool.take(lane) if pool is not None else None
     uf = None
     if kept is not None:
         up, uf = kept
+        if copy is not None and not copy.arm(up):
+            """Beaten before the first byte, so the tunnel is still clean."""
+            pool.give(lane, up, uf)
+            return "", 0, b"", False
     else:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         # cold lane
@@ -605,7 +847,10 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
             if err:
                 # lane dead
                 _close_quiet(sock)
-                if err == "timed out" and charge_timeout:
+                if copy is not None and copy.beaten:
+                    """Our own cut: not a failure, and not this lane's."""
+                    return "", 0, b"", False
+                if err == "timed out" and charge_timeout and _may():
                     # dead exit
                     _note_timeout(relay, lane, emit, seq, call_n)
                 emit({"type": "callend", "t": time.time(), "n": seq,
@@ -621,13 +866,20 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                 return err, 0, b"", True
             up = ssl.create_default_context().wrap_socket(
                 sock, server_hostname=host)
+            if copy is not None and not copy.arm(up):
+                """Beaten while dialling: this copy never says a word."""
+                _close_quiet(up)
+                return "", 0, b"", False
         except (ssl.SSLError, OSError) as exc:
             sock.close()
+            if copy is not None and copy.beaten:
+                """Our own cut: not a failure, and not this lane's."""
+                return "", 0, b"", False
             err = f"{type(exc).__name__}"
             if err == "ConnectionRefusedError":
                 # lane down
                 lane.healthy = False
-            if charge_timeout and isinstance(exc, ssl.SSLError):
+            if charge_timeout and isinstance(exc, ssl.SSLError) and _may():
                 # dead exit
                 _note_ssl(relay, lane, emit, seq, call_n)
             emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
@@ -690,6 +942,9 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
         # commit both
         nonlocal _committed
         if not _committed:
+            if copy is not None and not copy.claim():
+                """A lane that answered first already has the client."""
+                raise _Beaten
             _committed = True
             _to_client(bytes(_open))
             _open.clear()
@@ -889,6 +1144,9 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
               "client_wait_s": round(client_wait, 1),
               **_keys()})
         return "", status, bytes(held or b""), False
+    except _Beaten:
+        """A copy that lost: the winner has the client, so say nothing."""
+        return "", 0, b"", False
     # bad length
     except (ssl.SSLError, OSError, ValueError) as exc:
         err = f"{type(exc).__name__}"
@@ -897,12 +1155,12 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
         # held only
         seen = total if _committed else len(_open)
         # upstream only
-        if (charge_timeout and err.endswith("TimeoutError")
-                and last_op == "upstream"):
+        if (_witness() and err.endswith("TimeoutError")
+                and last_op == "upstream" and _may()):
             # charged here
             _note_timeout(relay, lane, emit, seq, call_n)
-        elif (charge_timeout and isinstance(exc, ssl.SSLError)
-                and last_op == "upstream"):
+        elif (_witness() and isinstance(exc, ssl.SSLError)
+                and last_op == "upstream" and _may()):
             # dead exit
             _note_ssl(relay, lane, emit, seq, call_n)
         if _committed and _cap:
