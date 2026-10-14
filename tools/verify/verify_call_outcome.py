@@ -5,11 +5,13 @@ import os
 import ssl
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lingling import mitm, proof  # noqa: E402
+from lingling.lanes import TorManager, LIMITED_FALLBACK_S, LIMITED_PATH
 
 FAIL = []
 
@@ -396,18 +398,44 @@ check("429 blames no lane here", relay7.refused == [],
 check("429 records the far end's retry-after",
       events7[-1]["retry_after"] == 12373, str(events7[-1]["retry_after"]))
 
-print("\n=== K2. the limit is per EXIT, so it is recorded on the lane ===")
-# Live proof: identical probes through six exits in
-lane_k = FakeLane()
-lane_k.limited_until = 0.0
-(_o13, events13, _c13, _r13) = drive(BUSY, lane=lane_k)
-# drive() runs on the fake Clock, so the
-check("the lane is marked limited", lane_k.limited_until > 0,
-      str(lane_k.limited_until))
-check("for at least the retry-after it was told",
-      lane_k.limited_until >= 12373, f"limited_until={lane_k.limited_until}")
-check("the event carries it too", events13[-1]["retry_after"] == 12373,
-      str(events13[-1]["retry_after"]))
+print("\n=== K2. the handler records the exit's bounded deadline ===")
+with tempfile.TemporaryDirectory() as tmp:
+    manager_k = TorManager(Path(tmp), count=1, exit_countries=["de"])
+    lane_k = manager_k.lanes[0]
+    lane_k.healthy = True
+    lane_k.exit_fingerprint = "A" * 40
+    relay_k = FakeRelay()
+    relay_k.tor = manager_k
+    relay_k.pick_lane = lambda exclude=None: lane_k
+    relay_k.any_unlimited = lambda exclude: False
+    request_k = (b"POST /zen/v1/responses HTTP/1.1\r\n"
+                 b"host: opencode.ai\r\ncontent-length: 13\r\n\r\n"
+                 b'{"model":"m"}')
+    client_k = ReqClient(request_k)
+    events13 = []
+    start_k = time.time()
+    mitm.netutil.socks5_open = lambda *a, **k: ""
+    mitm.ssl.create_default_context = lambda: FakeCtx()
+    mitm.socket.socket = lambda *a, **k: FakeSock(BUSY)
+    try:
+        mitm._serve(client_k, "opencode.ai", 443, 13,
+                    events13.append, relay_k)
+    finally:
+        (mitm.time, mitm.netutil.socks5_open,
+         mitm.ssl.create_default_context, mitm.socket.socket) = _real
+    check("the handler marks the lane limited",
+          lane_k.limited_until >= start_k + LIMITED_FALLBACK_S)
+    check("the global reset does not extend the exit's cooldown",
+          lane_k.limited_until <= time.time() + LIMITED_FALLBACK_S)
+    recorded_k = json.loads((Path(tmp) / LIMITED_PATH).read_text())
+    check("the same deadline is persisted for that relay",
+          recorded_k.get(lane_k.exit_fingerprint) == lane_k.limited_until)
+    check("the refusal reaches the router", relay_k.refused == [429])
+    check("the event preserves the server's original retry-after",
+          events13[-1]["retry_after"] == 12373)
+    check("the client receives the original 429, not an invented error",
+          client_k.got.startswith(b"HTTP/1.1 429")
+          and b"retry-after: 12373" in client_k.got)
 
 print("\n=== L. a pooled tunnel is reused and asked to stay open ===")# The SOCKS5 CONNECT plus TLS handshake is ~1.3s of Tor round trips (measured
 # 546ms + 723ms warm), so a reused tunnel

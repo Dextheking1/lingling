@@ -593,7 +593,8 @@ def main():
         universal = ("type", "t", "n", "c", "lane", "cc", "status", "kb",
                      "secs", "err", "reused", "cut", "max_wait_s",
                      "client_wait_s", "send_s", "peer_close",
-                     "first_byte_s", "first_event_s", "client_kb")
+                     "first_byte_s", "first_event_s", "client_kb",
+                     "raced")
         #: keys that mean something on only one outcome, by design.
         specific = {"retry_after", "stalled", "note"}
         gaps = [(ln, sorted(set(universal) - keys)) for ln, keys in emits
@@ -626,9 +627,12 @@ def main():
                   "verify_window_floors",
                   # the owner's FIRST rule -- never invent a
                   "verify_no_lane_cap",
-                  # the sticky router: a round elects a favorite, the
-                  # release ceiling and any verdict wake the others
+                  # the lane election: a round names the quickest lane, and
+                  # the release ceiling and any verdict reopen it
                   "verify_sticky",
+                  # every call goes out on every lane at once: the first
+                  # answer takes the client, and the losers are cut silent
+                  "verify_lane_race",
                   # the probe must warm the circuit the requests ride, not
                   # its own -- a credential that drifts per request makes
                   # Tor rebuild a circuit on every call

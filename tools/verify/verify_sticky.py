@@ -1,4 +1,4 @@
-"""The sticky router: one round elects a favorite, the favorite rides alone."""
+"""The lane election: the quickest of the round is named and leads the rest."""
 import socket
 import ssl
 import sys
@@ -208,23 +208,19 @@ def roundtrip_on(port, lane, relay, method="POST", path="/zen/v1/responses",
 
 
 def main():
-    print("=== (A) the round: five requests, one per lane, in order ===")
+    print("=== (A) the election: every lane offers, the quickest leads ===")
     events = []
     tor = FakeTor(emit=events.append)
     picked = elect(tor, {1: 9.0, 2: 4.5, 3: 12.0, 4: 7.0, 5: 8.0})
     print(f"  round order: {picked}  winner: {tor.sticky.winner}")
-    check("the round visits every lane once, in lane order",
+    check("a free round offers every lane, in lane order",
           picked == [1, 2, 3, 4, 5], f"{picked}")
     check("the lowest-time lane wins the election",
           tor.sticky.winner == 2 and tor.sticky.stuck_on(2),
           f"winner={tor.sticky.winner}")
     after = [tor.sticky.next_lane().index for _ in range(3)]
-    check("every later request rides the winner alone",
+    check("every later round starts on the quickest lane",
           after == [2, 2, 2], f"{after}")
-    check("the other lanes are frozen while stuck",
-          tor.sticky.frozen(1) and tor.sticky.frozen(5)
-          and not tor.sticky.frozen(2),
-          f"frozen(1)={tor.sticky.frozen(1)} frozen(2)={tor.sticky.frozen(2)}")
     kinds = [e.get("kind") for e in events if e.get("type") == "lane"]
     check("the election speaks in the proof pane",
           "sticky" in kinds, f"{kinds}")
@@ -275,7 +271,11 @@ def main():
           not tor.slow and tor.sticky.stuck_on(1) and status == 200,
           f"slow={tor.slow} stuck={tor.sticky.stuck_on(1)}")
 
-    print("\n=== (E) frozen lanes are not probed; the favorite is ===")
+    print("\n=== (E) an elected lane does not bench the others ===")
+    # A stick used to bench the lanes it was not riding from the sweep too.
+    # That is unsafe now, when every lane carries every call: a lane with
+    # no verdict yet has to keep being asked for one.
+    health.netutil.port_is_open = lambda *a, **k: True
     tor = FakeTor()
     daemon = SpyDaemon(tor)
     for lane in tor.lanes:
@@ -287,11 +287,11 @@ def main():
         lane.asked = False
     daemon.probed.clear()
     daemon.check_once()
-    stuck_sweep = list(daemon.probed)
+    later_sweep = list(daemon.probed)
     check("a free round probes every lane",
           first_sweep == [1, 2, 3, 4, 5], f"{first_sweep}")
-    check("while stuck, only the favorite is probed -- the rest idle",
-          stuck_sweep == [3], f"{stuck_sweep}")
+    check("and an elected quickest lane benches nobody",
+          later_sweep == [1, 2, 3, 4, 5], f"{later_sweep}")
 
     print("\n=== (F) a lane that fails mid-round is skipped, not waited for ===")
     # F1: the verdict lands after the survivors' times -- production order

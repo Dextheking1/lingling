@@ -1,5 +1,11 @@
-"""The health probe's 429 actually reaches the refusal handler."""
+"""The health probe's 429 actually reaches the refusal handler.
+
+And the relay's own 429 -- the one a real call runs into -- survives a
+move that blows up: the client already made its call, so a hook that
+raises may not take the request down with it.
+"""
 import pathlib
+import socket
 import sys
 import tempfile
 import time
@@ -8,6 +14,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from lingling import health  # noqa: E402
+from lingling import relay as relay_mod  # noqa: E402
 from lingling.lanes import Lane  # noqa: E402
 
 FAILS = []
@@ -61,18 +68,54 @@ def sweep(reply):
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="lingling-wire-"))
     tor = StubTor()
     daemon = health.HealthDaemon(tor)
-    lane = Lane(index=1, socks_port=0, control_port=0, exit_country="de",
-                data_dir=tmp)
-    lane.exit_fingerprint = "A" * 40
-    lane.process = FakeProc()
-    lane.healthy = True
-    # asked to run: the daemon now leaves a
-    lane.wanted = True
-    lane.asked = False
-    tor.lanes = [lane]
-    daemon.reachable = lambda _lane: reply
-    daemon.check_once()
+    # The lane has to really listen. A lane with nothing on its own SOCKS
+    # port is down, and `check_once` revives that instead of probing it.
+    with socket.socket() as srv:
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        lane = Lane(index=1, socks_port=srv.getsockname()[1], control_port=0,
+                    exit_country="de", data_dir=tmp)
+        lane.exit_fingerprint = "A" * 40
+        lane.process = FakeProc()
+        lane.healthy = True
+        # asked to run: the daemon now leaves a
+        lane.wanted = True
+        lane.asked = False
+        tor.lanes = [lane]
+        daemon.reachable = lambda _lane: reply
+        daemon.check_once()
     return tor, lane
+
+
+class HookTor:
+    """The relay's view of the pool: scoring, and a move that may blow up."""
+
+    def __init__(self, hook):
+        self.limit_hook = hook
+        self.scored = []
+        self.lanes = []
+
+    def note_result(self, country, status):
+        self.scored.append((country, status))
+
+
+def relay_sees(hook, status=429):
+    """Run the real `report_refused` with the pool's hook set to `hook`."""
+    tor = HookTor(hook)
+    events = []
+    relay = relay_mod.Relay.__new__(relay_mod.Relay)
+    relay.tor = tor
+    relay._emit = events.append
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="lingling-refused-"))
+    lane = Lane(index=3, socks_port=0, control_port=0, exit_country="se",
+                data_dir=tmp)
+    lane.healthy = True
+    raised = ""
+    try:
+        relay.report_refused(lane, status)
+    except Exception as exc:  # noqa: BLE001
+        raised = f"{type(exc).__name__}: {exc}"
+    return tor, lane, events, raised
 
 
 def main():
@@ -93,6 +136,40 @@ def main():
     check("a 403 probe marks the lane asked and moves nothing",
           tor.rotations == 0 and tor.restarts == 0 and lane.asked is True,
           f"rotations={tor.rotations} asked={lane.asked}")
+
+    print("\n=== a 429 the relay sees survives a move that blows up ===")
+    # The refusal arrives from a real call, inside the connection thread:
+    # stem 1.8.2 builds AuthChallengeFailed with an argument its
+    # constructor does not take, so moving the lane raised a TypeError
+    # that reached the thread boundary as a traceback, mid-TUI, on the
+    # request whose 429 triggered it.
+    boom = TypeError("AuthChallengeFailed.__init__() takes 3 positional "
+                    "arguments but 4 were given")
+
+    def exploding_move(lane, status):
+        raise boom
+
+    tor, lane, events, raised = relay_sees(exploding_move)
+    msgs = [e.get("msg", "") for e in events]
+    print(f"  raised={raised!r} events={msgs}")
+    check("a refusal whose move raises is reported, not thrown",
+          not raised and msgs and "moving it failed" in msgs[0],
+          f"raised={raised!r} events={msgs}")
+    check("the report names the lane, the status and the reason",
+          bool(msgs) and "lane 3" in msgs[0] and "(429)" in msgs[0]
+          and "AuthChallengeFailed" in msgs[0],
+          f"events={msgs}")
+    check("the refusal still scores the exit",
+          tor.scored == [("se", 429)], f"scored={tor.scored}")
+
+    print("\n=== with no health daemon the relay re-cooks the lane itself ===")
+    tor, lane, events, raised = relay_sees(None)
+    msgs = [e.get("msg", "") for e in events]
+    print(f"  healthy={lane.healthy} events={msgs}")
+    check("a refusal with no hook takes the lane out of service",
+          lane.healthy is False and not raised, f"healthy={lane.healthy}")
+    check("and says it is re-cooking it",
+          any("re-cooking it" in m for m in msgs), f"events={msgs}")
 
     print()
     if FAILS:

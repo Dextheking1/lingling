@@ -65,17 +65,35 @@ class FakeTor:
         return list(self.lanes)
 
 
+class ReviveTor(FakeTor):
+    """A pool whose relaunch works, so a revive can be seen."""
+
+    def __init__(self):
+        super().__init__()
+        self.restarted = []
+
+    def restart_lane(self, lane, repin=False):
+        self.restarted.append(lane.index)
+        lane.healthy = True
+        return True
+
+
 @contextlib.contextmanager
-def daemon(status, events=None):
+def daemon(status, events=None, raises=None, tor=None):
     """A daemon with the transport stubbed to answer `status`."""
+
+    def transport(*a, **k):
+        if raises is not None:
+            raise raises
+        return (status, b'{"error":{"type":"FreeUsageLimitError"}}')
+
     stubs = {
         "port_is_open": lambda *a, **k: True,
-        "https_via_socks": lambda *a, **k: (
-            status, b'{"error":{"type":"FreeUsageLimitError"}}'),
+        "https_via_socks": transport,
         "https_get_via_socks": lambda *a, **k: (
             200, b'{"IsTor":true,"IP":"203.0.113.9"}'),
     }
-    tor = FakeTor()
+    tor = tor if tor is not None else FakeTor()
     d = health.HealthDaemon(tor, check_interval=0.05,
                             event=(events.append if events is not None
                                    else None))
@@ -140,6 +158,44 @@ def main():
         d.check_once()
     check("a probe 403 still marks the lane asked",
           tor.lanes[0].asked is True, f"asked={tor.lanes[0].asked}")
+
+    print("\n=== no lane can hide from the sweep for a whole session ===")
+    # A lane skipped by the sweep rode traffic with no verdict, no exit IP
+    # and no line in the pane. Every lane now carries every call, so one
+    # with no verdict has to keep being asked for one.
+    events = []
+    with daemon(403, events) as (tor, d):
+        d.check_once()
+    lane = tor.lanes[0]
+    kinds = [e.get("kind") for e in events]
+    print(f"  unjudged lane: asked={lane.asked} kinds={kinds}")
+    check("a lane that was never judged gets its verdict",
+          lane.asked is True and "up" in kinds,
+          f"asked={lane.asked} kinds={kinds} -- the lane stays invisible")
+
+    print("\n=== a lane that is down is brought back ===")
+    events = []
+    with daemon(403, events, tor=ReviveTor()) as (tor, d):
+        tor.lanes[0].process = None
+        d.check_once()
+    msgs = [e.get("msg") for e in events]
+    print(f"  restarted={tor.restarted} msgs={msgs}")
+    check("a down lane is revived",
+          tor.restarted == [1],
+          f"restarted={tor.restarted} -- the revive was skipped")
+    check("and the pane says so",
+          any("brought it back" in (m or "") for m in msgs),
+          f"msgs={msgs}")
+
+    print("\n=== a probe that got no verdict says why ===")
+    events = []
+    with daemon(0, events, raises=TimeoutError("probe window")) as (tor, d):
+        d.check_once()
+    msg = (events[-1].get("msg") if events else "") or ""
+    print(f"  {msg!r}")
+    check("the no-verdict line names the reason",
+          "TimeoutError" in msg,
+          f"msg={msg!r} -- a cold circuit and a dead lane read the same")
 
     print("\n=== the branch is load-bearing: it fails on the old code ===")
     calls = []

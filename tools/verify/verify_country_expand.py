@@ -34,6 +34,12 @@ def build(count=6):
     mgr._used = {}
     #: no disk
     mgr._write_json = lambda *a: None
+    #: __init__ state the harness has to fake: nothing listens, nothing stops
+    mgr._emit = lambda e: None
+    mgr._stopping = False
+    mgr._rebuilds = []
+    #: built with __new__, so it has no lanes dir and no stray tors
+    mgr._clear_lane_dir_owner = lambda l: False
     return mgr
 
 
@@ -407,7 +413,10 @@ check("a lane that is merely dead is NOT re-pinned", pinned["n"] == 0,
       f"pins={pinned['n']}")
 
 print("\n=== T. a lane with a live request is not torn down mid-flight ===")
-# Tearing a lane down while it is carrying
+# Tearing a lane down while it is carrying work kills the answers its
+# users are waiting on -- thirty of them at once, on a night the pool was
+# busy. The move is handed to a watcher instead: the caller is never
+# blocked, and the tor is not stopped until the lane has nothing on it.
 mgr6 = build()
 mgr6._by_country = {}
 mgr6._limited = {}
@@ -426,21 +435,29 @@ threading.Thread(target=lambda: (time.sleep(0.6),
                                  setattr(lane6, "active", 0)),
                  daemon=True).start()
 t0 = time.time()
-mgr6.restart_lane(lane6)
-elapsed = time.time() - t0
-check("the restart waited for the live request",
-      elapsed >= 0.5 and stopped == [1],
-      f"waited {elapsed:.1f}s, stopped={stopped}")
+handed_off = mgr6.restart_lane(lane6)
+took = time.time() - t0
+check("the caller is not made to wait for the live request",
+      handed_off is False and took < 0.3,
+      f"took {took:.2f}s, moved={handed_off} -- the move blocked the caller")
+check("and the tor is not stopped while it is still live",
+      stopped == [], f"stopped={stopped} -- the answer died under the move")
+deadline = time.time() + 5
+while not stopped and time.time() < deadline:
+    time.sleep(0.05)
+check("the tor is stopped once the request finishes",
+      stopped == [1], f"stopped={stopped}")
 
 lane7 = mgr6.lanes[1]
 lane7.socks_port = 59907
 lane7.control_port = 59908
 lane7.active = 0
 t0 = time.time()
-mgr6.restart_lane(lane7)
+moved7 = mgr6.restart_lane(lane7)
 idle = time.time() - t0
-check("an idle lane restarts without waiting for a drain", idle < elapsed,
-      f"idle={idle:.2f}s vs busy={elapsed:.2f}s")
+check("an idle lane restarts at once",
+      moved7 is True and idle < 0.5 and stopped == [1, 2],
+      f"idle={idle:.2f}s stopped={stopped}")
 
 print("\n=== U. a fully limited pool stops retrying instead of amplifying ===")
 # Live: 3.5 attempts per request with 71% of

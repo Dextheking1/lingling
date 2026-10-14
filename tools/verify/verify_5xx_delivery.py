@@ -69,6 +69,10 @@ class FakeSock:
     def makefile(self, _m):
         return self._r
 
+    def shutdown(self, _how):
+        """A loser is shut down before it is closed, as a real socket is."""
+        self.closed = True
+
     def close(self):
         self.closed = True
 
@@ -260,13 +264,18 @@ check("200 streams as before", out200[1] == 200, str(out200[1]))
 check("the note key is present and empty", events200[-1].get("note") == "",
       repr(events200[-1].get("note")))
 
-print("\n=== D. two 5xx attempts, then the far end's own 503 is delivered ===")
-(client, events, relay) = serve([S503, S503], n_lanes=5)
+print("\n=== D. one round over the whole pool, then the far end's 503 ===")
+# A request now goes out on every lane at once, so a 503 from the edge is
+# seen by the whole pool in one round instead of one lane at a time.
+(client, events, relay) = serve([S503] * 5, n_lanes=5)
 ends = [e for e in events if e.get("type") == "callend"]
-check("it stopped at two attempts", len(relay.dials) == 2,
+calls = [e for e in events if e.get("type") == "call"]
+check("one round covered every lane", len(relay.dials) == 5,
       str(len(relay.dials)))
-check("both attempts were 503", [e["status"] for e in ends] == [503, 503],
+check("every lane saw the 503", [e["status"] for e in ends] == [503] * 5,
       str([e["status"] for e in ends]))
+check("and the pane saw one call, not one per lane", len(calls) == 1,
+      str(len(calls)))
 check("the client got the far end's own 503, head first",
       client.got.startswith(b"HTTP/1.1 503"), repr(client.got[:40]))
 check("with the body after it", b"edge is unwell" in client.got,
@@ -274,21 +283,22 @@ check("with the body after it", b"edge is unwell" in client.got,
 check("no invented 502 anywhere", b"502" not in client.got,
       repr(client.got[:40]))
 
-print("\n=== E. a 5xx then a 200 is invisible to the client ===")
-(client, events, relay) = serve([S503, SSE_200], n_lanes=3)
-check("two attempts", len(relay.dials) == 2, str(len(relay.dials)))
+print("\n=== E. a lane's 5xx is invisible to the client ===")
+(client, events, relay) = serve([S503, SSE_200, S503], n_lanes=3)
+last = [e for e in events if e.get("type") == "callend"][-1]
 check("the client got the 200", client.got.startswith(b"HTTP/1.1 200"),
       repr(client.got[:40]))
+check("and none of the 503 leaked into it", b"503" not in client.got,
+      repr(client.got[:80]))
+check("the call ended on the lane that answered", last["status"] == 200,
+      str(last["status"]))
 
-print("\n=== F. a transport error between 5xx attempts keeps the held 503 ===")
+print("\n=== F. a transport error between copies does not end the round ===")
 (client, events, relay) = serve([S503, None, SSE_200], n_lanes=4)
-ends = [e for e in events if e.get("type") == "callend"]
-check("three attempts ran", len(relay.dials) == 3, str(len(relay.dials)))
-check("the middle attempt died in transport",
-      ends[1]["status"] == 0 and ends[1]["err"] != "" and ends[1]["cut"],
-      repr(ends[1]))
 check("the client still got the 200",
       client.got.startswith(b"HTTP/1.1 200"), repr(client.got[:40]))
+check("no invented 502 anywhere", b"502" not in client.got,
+      repr(client.got[:40]))
 
 print("\n=== G. a 429 pool exhausted delivers the 429, not a 502 ===")
 (client, events, relay) = serve([S429], n_lanes=2)
@@ -303,7 +313,8 @@ S500 = (b"HTTP/1.1 500 Internal Server Error\r\n"
         b"content-type: application/json\r\ncontent-length: 9\r\n\r\n"
         b'{"e":"x"}')
 (client, events, relay) = serve([S500], n_lanes=3)
-check("one attempt only", len(relay.dials) == 1, str(len(relay.dials)))
+check("only the lane that answered talked to the far end",
+      len(relay.dials) == 1, str(len(relay.dials)))
 check("the 500 went straight out",
       client.got.startswith(b"HTTP/1.1 500"), repr(client.got[:40]))
 check("its body reached the client verbatim", b'{"e":"x"}' in client.got,

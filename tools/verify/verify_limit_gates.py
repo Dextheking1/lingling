@@ -75,6 +75,14 @@ class FakeTor:
         return True
 
 
+#: These fake lanes stand in for a live pool, so their ports answer. The
+#: sweep now treats a lane with nothing on its own SOCKS port as down, and
+#: this suite is about limit/refusal semantics, not port liveness -- see
+#: verify_lane_revive for that. Without this, the fixture would depend on
+#: whatever happens to be listening on 52001..52006 on the test machine.
+H.netutil.port_is_open = lambda *a, **k: True
+
+
 def daemon(n=6):
     tor = FakeTor(n)
     ev = []
@@ -191,6 +199,29 @@ check("no lane is retired for it", all(l.healthy for l in tor.lanes),
       str([l.healthy for l in tor.lanes]))
 check("nothing is re-cooked", tor.restarted == [], str(tor.restarted))
 check("the client still gets an answer", b"502" in w.got, repr(w.got[:24]))
+
+print("\n=== G. a refusal whose lane work blows up still answers ===")
+# Moving a lane is upkeep, not the request: the call the client already
+# made has to survive whatever the hook does with it.
+tor, _d, ev = daemon()
+
+
+def _boom(lane, status):
+    raise TypeError("AuthChallengeFailed.__init__() takes 3 positional "
+                    "arguments but 4 were given")
+
+
+tor.limit_hook = _boom
+raised = None
+try:
+    Relay(tor, event=ev.append).report_refused(tor.lanes[0], 429)
+except Exception as exc:  # noqa: BLE001
+    raised = exc
+check("a hook that raises cannot escape the refusal path", raised is None,
+      repr(raised))
+check("and the pane is told the move failed",
+      any(e.get("kind") == "fail" and "429" in e.get("msg", "") for e in ev),
+      str([e.get("msg") for e in ev if e.get("kind") == "fail"]))
 
 print("\n=== F. there is no concurrency cap ===")
 # Holding traffic while a healthy lane sat idle,

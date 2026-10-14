@@ -33,9 +33,7 @@ def scratch() -> Path:
 def cleanup() -> None:
     for d in _DIRS:
         shutil.rmtree(d, ignore_errors=True)
-    base = Path(tempfile.gettempdir())
-    for d in base.glob("ll-lock-*"):
-        shutil.rmtree(d, ignore_errors=True)
+
 
 
 def main() -> int:
@@ -112,8 +110,9 @@ def main() -> int:
     src = (ROOT / "lingling" / "cli.py").read_text(encoding="utf-8")
     check("the gate runs before the loader is built",
           src.index("_other_lingling()") < src.index("loader = _Loader()"))
-    check("the release runs in the finally",
-          "netutil.release_session_lock" in src.split("finally:")[1])
+    check("the owner releases only after the session returns",
+          "return _session(opts, opencode)\n    finally:\n"
+          "        netutil.release_session_lock(DATA_DIR)" in src)
     check("a refused launcher gets a plain line and exit 1",
           "one kitchen" in src)
 
