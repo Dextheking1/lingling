@@ -71,27 +71,42 @@ def _render(ev: Dict) -> str:
     if ev.get("type") == "call":
         n = ev.get("n", 0)
         c = ev.get("c", 0)
-        lane = ev.get("lane", 0)
-        cc = ev.get("cc") or "??"
-        ip = ev.get("ip") or "..."
+        lanes = ev.get("lanes") or []
         model = ev.get("model") or ""
         what = _c(model, "1;35") if model else _c(
             f"{ev.get('method', '')} {ev.get('path', '')}", "37")
+        if len(lanes) > 1:
+            ccs = ",".join(ev.get("ccs") or [])
+            who = _c(f"lanes {','.join(str(i) for i in lanes)} "
+                     f"{{{ccs}}}", "32")
+        else:
+            lane = ev.get("lane", 0)
+            cc = ev.get("cc") or "??"
+            ip = ev.get("ip") or "..."
+            who = f"{_c(f'lane {lane} {{{cc}}}', '32')} {_c(ip, '90')}"
         return (f"{_c(ts, '90')}  {_c('#' + str(n) + '.' + str(c), '36')}  "
-                f"{_c(f'lane {lane} {{{cc}}}', '32')} {_c(ip, '90')}  "
-                f"->  {what}")
+                f"{who}  ->  {what}")
     if ev.get("type") == "callend":
         n = ev.get("n", 0)
         c = ev.get("c", 0)
         status = ev.get("status", 0)
         err = ev.get("err") or ""
+        served = bool(status) and (ev.get("kb") or 0) > 0
+        # far-end hangup
+        hung_up = (served and 200 <= status < 300
+                   and ev.get("stalled") == "client")
         if err:
-            # served, cut
-            if status and (ev.get("kb") or 0) > 0:
+            if hung_up:
+                """The far end left. Nothing of ours was cut, and no lane
+                is at fault: the answer had already been delivered.
+                """
+                verdict = _c(str(status), "32") + _c("  client hung up", "90")
+            elif served:
+                # served, cut
                 verdict = _c(f"{status} cut ({err})", "31")
             else:
                 verdict = _c(f"failed ({err})", "31")
-            if ev.get("stalled"):
+            if ev.get("stalled") and not hung_up:
                 verdict += _c(f" [{ev['stalled']} stalled]", "90")
         elif status == 429 and '"server_error"' not in (ev.get("note") or ""):
             mins = round((ev.get("retry_after") or 0) / 60)
@@ -105,8 +120,13 @@ def _render(ev: Dict) -> str:
                 verdict += _c(" STREAM CUT mid-body", "31")
             if status >= 400 and ev.get("note"):
                 verdict += _c(f"  {ev['note'][:80]}", "90")
+        who = ""
+        if (ev.get("raced") or 0) > 1:
+            # winning lane
+            who = _c(f"lane {ev.get('lane', 0)} {{{ev.get('cc') or '??'}}}",
+                     "32") + " "
         return (f"{_c(ts, '90')}    {_c('|', '90')} "
-                f"{_c(f'#{n}.{c}', '90')} {verdict} "
+                f"{_c(f'#{n}.{c}', '90')} {who}{verdict} "
                 f"{_c(_lat_bits(ev), '90')}")
     if ev.get("type") == "flow":
         # dim heartbeat.
@@ -132,7 +152,8 @@ def _render(ev: Dict) -> str:
 def tail(path: Path) -> int:
     print(_c("lingling lanes -- live proof", "1"))
     print(_c(f"tailing {path}", "90"))
-    print(_c("every request below shows the exit lane it actually rode.\n", "90"))
+    print(_c("every request below shows the lanes that raced it, and the "
+             "one that answered.\n", "90"))
     # this session
     pos = path.stat().st_size if path.exists() else 0
     try:
