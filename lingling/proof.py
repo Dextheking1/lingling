@@ -1,4 +1,4 @@
-"""Proof pane: events append as JSON lines to ``data/proof.log``; a second console tails and renders ..."""
+"""Proof pane: events append as JSON lines, tailed by a second console."""
 
 from __future__ import annotations
 
@@ -10,7 +10,16 @@ import time
 from pathlib import Path
 from typing import Dict
 
+from . import netutil
+from .bench import FREE_LIMIT, RATE_LIMIT, bench_span
+
 DONE = {"type": "done"}
+
+#: refusal note
+QUOTA_NOTE = netutil.QUOTA_SPENT.decode("ascii")
+UPSTREAM_NOTE = netutil.UPSTREAM_UNAVAILABLE.decode("ascii")
+#: parked threshold
+_PARKED_S = 20.0
 
 _LOCK = threading.Lock()
 
@@ -46,6 +55,36 @@ def _lat_bits(ev: Dict) -> str:
     if ev.get("reused"):
         bits.append("reused tunnel")
     return "  ".join(bits)
+
+
+def _section(ev: Dict) -> str:
+    """Which notepad section a 429 belongs in: the event's own, or its body."""
+    section = ev.get("limit")
+    if section:
+        return str(section)
+    note = ev.get("note") or ""
+    # older event
+    if QUOTA_NOTE in note:
+        return FREE_LIMIT
+    if UPSTREAM_NOTE in note:
+        return ""
+    return RATE_LIMIT
+
+
+def _reset(ev: Dict) -> str:
+    """The wall's bench deadline, in the operator's clock and in UTC."""
+    stamp = (ev.get("t") or time.time()) + bench_span(
+        FREE_LIMIT, ev.get("retry_after") or 0)
+    return (f"{time.strftime('%H:%M', time.localtime(stamp))} "
+            f"({time.strftime('%H:%M UTC', time.gmtime(stamp))})")
+
+
+def _wait(ev: Dict) -> str:
+    """The bench the notepad will apply, in the unit that reads best."""
+    wait = bench_span(_section(ev), ev.get("retry_after") or 0)
+    if wait < 90:
+        return f"{round(wait)}s"
+    return f"{round(wait / 60)}m"
 
 
 def _render(ev: Dict) -> str:
@@ -97,9 +136,7 @@ def _render(ev: Dict) -> str:
                    and ev.get("stalled") == "client")
         if err:
             if hung_up:
-                """The far end left. Nothing of ours was cut, and no lane
-                is at fault: the answer had already been delivered.
-                """
+                # peer gone
                 verdict = _c(str(status), "32") + _c("  client hung up", "90")
             elif served:
                 # served, cut
@@ -108,11 +145,19 @@ def _render(ev: Dict) -> str:
                 verdict = _c(f"failed ({err})", "31")
             if ev.get("stalled") and not hung_up:
                 verdict += _c(f" [{ev['stalled']} stalled]", "90")
-        elif status == 429 and '"server_error"' not in (ev.get("note") or ""):
-            mins = round((ev.get("retry_after") or 0) / 60)
-            note = (f" exit limited {mins}m -- moving lanes" if mins
-                    else " exit limited -- moving lanes")
-            verdict = _c("429", "33") + _c(note, "90")
+        elif status == 429 and _section(ev) == FREE_LIMIT:
+            # daily wall
+            verdict = _c("429", "33") + _c(
+                f" free limit -- exit out until {_reset(ev)} -- moving it",
+                "90")
+        elif status == 429 and _section(ev) == RATE_LIMIT:
+            # burst limit
+            verdict = _c("429", "33") + _c(
+                f" rate limit -- exit out {_wait(ev)} -- moving it", "90")
+        elif status == 429:
+            # opencode edge
+            verdict = _c(
+                "429 OPENCODE EDGE UNAVAILABLE -- not this exit", "1;33")
         else:
             color = "32" if 200 <= status < 300 else "31"
             verdict = _c(str(status), color)
@@ -132,8 +177,11 @@ def _render(ev: Dict) -> str:
         # dim heartbeat.
         n = ev.get("n", 0)
         kb = ev.get("kb", 0)
+        # silent wait
+        waited = ev.get("waited_s") or 0
+        gap = f" -- no bytes for {waited:.0f}s" if waited >= _PARKED_S else ""
         return (f"{_c(ts, '90')}    {_c('|', '90')} "
-                f"{_c(f'tunnel #{n} still streaming -- {kb} KB so far', '90')}")
+                f"{_c(f'tunnel #{n} still streaming -- {kb} KB so far{gap}', '90')}")
     if ev.get("type") == "reqend":
         n = ev.get("n", 0)
         kb = ev.get("kb", 0)
@@ -152,8 +200,7 @@ def _render(ev: Dict) -> str:
 def tail(path: Path) -> int:
     print(_c("lingling lanes -- live proof", "1"))
     print(_c(f"tailing {path}", "90"))
-    print(_c("every request below shows the lanes that raced it, and the "
-             "one that answered.\n", "90"))
+    print()
     # this session
     pos = path.stat().st_size if path.exists() else 0
     try:

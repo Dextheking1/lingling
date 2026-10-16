@@ -1,11 +1,4 @@
-"""lingling -- official OpenCode, riding rotating Tor lanes.
-
-Windows hands a console-mode child of a CONSOLE-LESS parent a brand new,
-VISIBLE console, so an opencode ``service restart`` or ``--help`` issued
-from a launch that has no console of its own would flash a terminal window
-for every call. Those two run quiet; the interactive TUI launch
-deliberately does not, because it must inherit the console it is shown in.
-"""
+"""lingling -- official OpenCode, riding rotating Tor lanes"""
 
 from __future__ import annotations
 
@@ -19,8 +12,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import __version__, data_dir, proof
-from .health import HealthDaemon
+from . import __version__, bounds, data_dir, proof
+from .health import ExitSweep, HealthDaemon
 from .lanes import TorManager
 from .relay import Relay
 from . import netutil
@@ -36,9 +29,14 @@ PROOF_LOG = DATA_DIR / "proof.log"
 
 DEFAULT_COUNTRIES = ["us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"]
 
+DEFAULT_LANES = 5
+
+#: lane ceiling
+MAX_LANES = 64
+
 
 def load_countries(path: Optional[Path] = None) -> tuple:
-    """Country override: <data dir>/countries.txt, line 1 primary, line 2 fallback, line 3 preferred."""
+    """Country override: <data dir>/countries.txt, one country per line."""
     path = path or (DATA_DIR / "countries.txt")
     if path.exists():
         try:
@@ -100,12 +98,7 @@ class _Loader:
         self._thread.start()
 
     def _run(self) -> None:
-        """
-        The percent only repaints when tor itself advances, so a five
-        second gap reads as a hang. The elapsed counter ticks every
-        second whether or not anything else changed -- motion that
-        proves the loop is alive, and the honest cost of the wait.
-        """
+        """Percent only repaints when tor advances, so a five second gap reads as a hang."""
         tick = itertools.count()
         while not self._stop.is_set():
             t = next(tick)
@@ -131,10 +124,35 @@ class _Loader:
             sys.stdout.flush()
 
 
+def _lane_count(raw: str) -> int:
+    """``--lanes``, held inside what one machine can actually run."""
+    try:
+        asked = int(raw)
+    except ValueError:
+        print(f"lingling: --lanes {raw} is not a number -- using "
+              f"{DEFAULT_LANES}")
+        return DEFAULT_LANES
+    if asked < 1:
+        print(f"lingling: --lanes {asked} is below 1 -- using 1")
+        return 1
+    if asked > MAX_LANES:
+        print(f"lingling: --lanes {asked} is above {MAX_LANES} -- using "
+              f"{MAX_LANES}")
+        return MAX_LANES
+    return asked
+
+
+def _report_bounds() -> None:
+    """Say what a hand-set knob got clamped to, before anything boots."""
+    for note in bounds.notes:
+        print(f"lingling: {note}")
+
+
 def _parse_args(argv: list[str]) -> dict:
     """Split lingling's own flags from args passed through to opencode."""
     opts = {
-        "lanes": int(os.environ.get("LINGLING_TOR_COUNT", "5") or 5),
+        "lanes": bounds.count("LINGLING_TOR_COUNT", DEFAULT_LANES,
+                              1, MAX_LANES),
         "no_tor": False,
         "no_proof": False,
         "proof_tail": None,
@@ -152,18 +170,10 @@ def _parse_args(argv: list[str]) -> dict:
         elif a == "--demo":
             opts["demo"] = True
         elif a == "--lanes":
-            """
-            A bare --lanes must not eat the flag after it: swallowing
-            --demo or --no-proof here silently flips cold-start messaging
-            and proof spawning without the user ever passing a count.
-            """
             if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
-                try:
-                    opts["lanes"] = max(1, int(argv[i + 1]))
-                    opts["lanes_explicit"] = True
-                    skip = True
-                except ValueError:
-                    pass
+                opts["lanes"] = _lane_count(argv[i + 1])
+                opts["lanes_explicit"] = True
+                skip = True
         elif a == "--no-tor":
             opts["no_tor"] = True
         elif a == "--no-proof":
@@ -176,15 +186,7 @@ def _parse_args(argv: list[str]) -> dict:
 def _boot_gate(manager: TorManager, first, daemon: HealthDaemon,
                download_limit: float = 120, quick_limit: float = 30,
                deep_limit: float = 45, deadline_s: float = 600) -> bool:
-    """Wait for the first lane: progress first, probe only when tor is done.
-
-    A stalled boot is almost always the relay pinned from the cached
-    consensus of a previous session having gone offline -- StrictNodes
-    then forbids every circuit and tor sits at one percent forever. The
-    ladder attacks that directly: re-pin a fresh relay in the same
-    country first (cache intact, one warm boot), then rotate the country
-    the way a timeout does, and only then regenerate the directory.
-    """
+    """Wait for the first lane: progress first, probe only when tor is done"""
     deadline = time.time() + deadline_s
     last_pct = -1
     last_pct_at = time.time()
@@ -192,13 +194,7 @@ def _boot_gate(manager: TorManager, first, daemon: HealthDaemon,
     cache_moved = False
     pokes = 0
     while time.time() < deadline:
-        """
-        Evidence before the probe. The exit probe blocks for its whole
-        window against a half-booted tor, and the old order ran it first --
-        so the screen froze on tor 0% while tor raced to 100% unobserved.
-        The gate stays silent: one pinned line owns the screen, the clock
-        beside it proves liveness, and this loop only acts.
-        """
+        # probe last
         pct = manager.lane_bootstrap_pct(first)
         cache_at = manager.cache_mtime(first)
         if pct > last_pct:
@@ -212,14 +208,11 @@ def _boot_gate(manager: TorManager, first, daemon: HealthDaemon,
         if pct >= 100:
             code = daemon.reachable(first, probe_timeout=8)
             if code == 429:
-                daemon.on_refused(first, code)
+                daemon.refuse(first, code)
             elif code:
                 first.healthy = True
                 return True
-        """
-        A dead exit at 100% escalates on the same ladder as a stalled
-        boot: the probe failing is silence too, just a slower one.
-        """
+        # probe ladder
         # stuck checks
         stall = time.time() - last_pct_at
         limit = download_limit if (cache_moved and pct <= 10) else \
@@ -373,11 +366,6 @@ def _running_children() -> list:
                 if not k.Process32Next(snap, ctypes.byref(entry)):
                     break
         k.CloseHandle(snap)
-    """
-    This uninstaller is itself a lingling.exe, and so is the shim above
-    it -- count only *other* boots, by walking up the parent chain through
-    the process snapshot. One source of names, so nothing double counts.
-    """
     mine = {os.getpid()}
     pid = parents.get(os.getpid())
     while pid and pid in parents and len(mine) < 8:
@@ -408,10 +396,7 @@ def _uninstall(rest: list[str]) -> int:
     if not DATA_DIR.exists():
         print("nothing to remove -- no lingling data dir on this machine.")
         return 0
-    """
-    countries.txt is the one thing here a user cannot get back: it is
-    hand-written, not downloaded. Keep it and every backup of it.
-    """
+    # hand-written
     keep = {p.name for p in DATA_DIR.iterdir()
             if p.name.startswith("countries")}
     entries = []
@@ -434,11 +419,7 @@ def _uninstall(rest: list[str]) -> int:
         try:
             answer = input(f"delete all of it ({_human(total)})? [y/N] ")
         except EOFError:
-            """
-            A closed or NUL stdin reports as a tty on Windows, so
-            isatty() cannot tell us nobody is there -- the EOF does.
-            Refusing by name beats a cancel the caller cannot see.
-            """
+            # tty lies
             print("refusing to wipe without --yes in a non-interactive shell.")
             return 1
         if answer.strip().lower() not in ("y", "yes"):
@@ -472,16 +453,7 @@ def _uninstall(rest: list[str]) -> int:
 
 
 def _say_update(check_obj) -> None:
-    """The update notice, the one question, and the one install.
-
-    All of it is held until the terminal is handed over: the spinner
-    owns the line until then, and a notice printed under a live spinner
-    is erased by its next repaint. At most one install is scheduled per
-    session, and never while a lane is hot.
-
-    `askable` is decided here, once, and handed to both calls, so the
-    notice and the question can never disagree about who is being asked.
-    """
+    """The update notice, the one question, and the one install"""
     info = check_obj.info if check_obj is not None else None
     ask = update.askable(info)
     update.emit(check_obj, ask=ask)
@@ -520,10 +492,11 @@ def main(argv: list[str]) -> int:
 
     if "--version" in opts["passthrough"] or "-v" in opts["passthrough"]:
         print(f"lingling {__version__} (wraps opencode)")
-        """From cache only: asking the version must not cost a request."""
+        # cache only
         update.cached_hint(DATA_DIR)
         return 0
 
+    _report_bounds()
     opencode = shutil.which("opencode")
     if opencode is None:
         print("lingling: couldn't find `opencode` on your PATH.")
@@ -537,11 +510,7 @@ def main(argv: list[str]) -> int:
         print("Reinstall it:  pip install --force-reinstall cryptography")
         return 1
 
-    """
-    One session, enforced: the teardown sweep is only safe with a single
-    owner, so a second launcher is turned away before any lane, relay,
-    or opencode exists.
-    """
+    # single owner
     try:
         other = _other_lingling()
     except OSError as exc:
@@ -561,19 +530,8 @@ def main(argv: list[str]) -> int:
 def _session(opts: dict, opencode: str) -> int:
     _migrate_countries()
     _spawn_geoip_fallback()
-    """
-    The update check rides the boot rather than preceding it: this call
-    only starts a thread, and the answer is collected at the handoff
-    seconds or minutes later. A dead endpoint therefore costs a launch
-    nothing, and an offline machine still cannot tell it ran.
-    """
+    # boot thread
     update_check = update.start(DATA_DIR)
-    """
-    Two lines, that is the whole message list. Pinned before the spinner
-    ticks and never replaced until the lane serves: tor refreshing its
-    consensus on every start used to stomp these with progress chatter,
-    which is how warm boots claimed to be first starts.
-    """
     loader = _Loader()
     if _cache_is_cold(DATA_DIR):
         loader.steady("first run -- pulling the relay directory, "
@@ -583,6 +541,7 @@ def _session(opts: dict, opencode: str) -> int:
     loader.start()
     manager: TorManager | None = None
     daemon: HealthDaemon | None = None
+    sweep: ExitSweep | None = None
     relay: Relay | None = None
     direct = opts["no_tor"]
     end_code: list = []
@@ -610,8 +569,7 @@ def _session(opts: dict, opencode: str) -> int:
                 emit = proof.make_emitter(PROOF_LOG)
                 manager.sticky.attach(emit)
                 manager.attach(emit)
-                daemon = HealthDaemon(manager, event=emit,
-                                      log=lambda *a: None)
+                daemon = HealthDaemon(manager, event=emit, log=lambda *a: None)
 
                 def _report_boot(lane, status) -> None:
                     """Say so when a lane did not come up."""
@@ -635,6 +593,9 @@ def _session(opts: dict, opencode: str) -> int:
                     manager.stop_all()
                 else:
                     daemon.start()
+                    sweep = ExitSweep(manager, event=emit,
+                                      log=lambda *a: None)
+                    sweep.start()
 
         if direct:
             loader.stop()
@@ -696,6 +657,8 @@ def _session(opts: dict, opencode: str) -> int:
         return code
     finally:
         try:
+            if sweep:
+                sweep.stop()
             if daemon:
                 daemon.stop()
         finally:
@@ -727,13 +690,7 @@ def _session(opts: dict, opencode: str) -> int:
 
 
 def _spawn_geoip_fallback() -> None:
-    """One background copy of the bundle geoip into the data dir's root.
-
-    Onions: country inference for the proof window reads that root, and
-    the copy must not delay the boot, so it runs after the loader is
-    already spinning. Resumability is preserved: every real geoip file
-    stays exactly where the bundle unpacked it.
-    """
+    """One background copy of the bundle geoip into the data dir's root"""
     dst = DATA_DIR / "geoip"
     if dst.exists():
         return
@@ -756,22 +713,7 @@ _SERVER_ERA: Optional[bool] = None
 
 
 def _uses_background_server(binary: str) -> bool:
-    """True when this opencode makes its model calls in a background server.
-
-    From 2.0.26 the TUI is only a client. The call itself is made by a
-    separate server process, and that process keeps the environment it was
-    STARTED with -- so a server born outside lingling carries no proxy, and
-    every model call leaves without a lane: the proof pane stays empty and
-    the exit the free tier counts is the user's own IP.
-
-    ``--standalone`` is not the answer. Its private server drops the
-    environment too, and it hides the shared server instead of fixing it.
-    The server itself has to be restarted under our environment, which is
-    exactly what the client/server CLI exposes.
-
-    ``--standalone`` is the marker for that era, so one help call answers
-    both "is there a server" and "does restarting it exist".
-    """
+    """From 2.0.26 the TUI is only a client"""
     global _SERVER_ERA
     if _SERVER_ERA is None:
         try:
@@ -786,19 +728,7 @@ def _uses_background_server(binary: str) -> bool:
 
 
 def _server(binary: str, env: dict, action: str) -> None:
-    """Restart or stop the background server under our environment.
-
-    A running server keeps the environment it was born with, so the only
-    way a proxy reaches it is a restart -- and it must be restarted before
-    the TUI connects, not after. Stopping it on the way out matters just
-    as much: a server left holding a relay port that no longer exists
-    would break the next plain opencode on this machine.
-
-    The variables go into our own environment for the call rather than
-    through an explicit ``env=`` block. Windows does not hand a detached
-    server the proxy it was given that way -- measured, 0 calls proxied
-    against 12 for an inherited block -- and the server is detached here.
-    """
+    """Windows does not hand a detached server the proxy it was given."""
     names = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
              "NO_PROXY", "no_proxy", "NODE_EXTRA_CA_CERTS")
     saved = {name: os.environ.get(name) for name in names}
@@ -806,10 +736,7 @@ def _server(binary: str, env: dict, action: str) -> None:
         if env.get(name) is not None:
             os.environ[name] = env[name]
     try:
-        """Decode as UTF-8 with ``errors="replace"``: a ``text=True`` read
-        of this binary's output dies on cp1252 for any character outside it,
-        and the exception is swallowed below -- a restart that never
-        happened, reported as a session with no proxy at all."""
+        # cp1252 trap
         subprocess.run([binary, "service", action], capture_output=True,
                        text=True, encoding="utf-8", errors="replace",
                        timeout=60, creationflags=netutil._NO_WINDOW)
@@ -823,15 +750,9 @@ def _server(binary: str, env: dict, action: str) -> None:
                 os.environ[name] = old
 
 
-def _run_opencode(binary: str, args: list[str],
-                  env: dict | None) -> int:
+def _run_opencode(binary: str, args: list[str], env: dict | None) -> int:
     """Exec opencode with stdio inherited so it owns the terminal."""
-    """
-    The TUI takes seconds to paint its first frame and says nothing while
-    it does -- a blank screen here read as a crash, and a Ctrl+C into it
-    made that true. The handoff line lands before the blank pause starts,
-    and the exit line says who ended the session when the child does.
-    """
+    # TUI quiet
     print(_c(" handoff: starting opencode -- its TUI loads quietly for a "
              "few seconds.", "90"), flush=True)
     server = env is not None and _uses_background_server(binary)
@@ -868,6 +789,6 @@ def entry() -> None:
     try:
         sys.exit(main(sys.argv[1:]))
     except KeyboardInterrupt:
-        """A boot cut short is a choice, not a crash -- no traceback."""
+        # short boot
         print(_c(" Ctrl+C -- closing the kitchen.", "90"))
         sys.exit(130)

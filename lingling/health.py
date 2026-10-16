@@ -8,7 +8,8 @@ import threading
 import time
 from typing import Callable, Dict, Optional
 
-from . import netutil
+from . import bounds, netutil
+from .bench import FREE_LIMIT, RATE_LIMIT
 from .lanes import Lane, TorManager
 
 UPSTREAM_HOST = "opencode.ai"
@@ -39,8 +40,21 @@ UPSTREAM_UA = os.environ.get("LINGLING_UPSTREAM_USER_AGENT", "opencode/1.0")
 
 PROBE_TIMEOUT = 15.0
 
+#: sweep interval
+SWEEP_S = bounds.number("LINGLING_SWEEP_S", 20, 0.0, bounds.WINDOW_S)
+
 #: probe verdicts
 PROBE_VERDICTS = (200, 403, 429)
+
+
+def _lane_event(emit: Callable[[Dict], None], lane: Lane, kind: str,
+                message: str) -> None:
+    """One lane event, shaped the one way the pane reads."""
+    emit({
+        "type": "lane", "kind": kind, "t": time.time(),
+        "lane": lane.index, "cc": lane.exit_country,
+        "ip": lane.exit_ip, "msg": message,
+    })
 
 
 class HealthDaemon:
@@ -84,13 +98,9 @@ class HealthDaemon:
             self._stop.wait(self.check_interval)
 
     def reachable(self, lane: Lane, probe_timeout: float = PROBE_TIMEOUT) -> int:
-        """One hand-rolled request through the lane: its HTTP status, or 0 if nothing came back.
-
-        A 0 says only that this probe got no verdict, so the reason is
-        kept on the lane: a cold circuit that missed its window and a lane
-        that cannot carry a request at all used to print the same line.
-        """
+        """One request through the lane: its HTTP status, or 0 if nothing came back."""
         lane.probe_note = ""
+        lane.probe_reason = ""
         if not netutil.port_is_open("127.0.0.1", lane.socks_port,
                                     timeout=netutil.PORT_CHECK_TIMEOUT):
             lane.probe_note = "port closed"
@@ -106,10 +116,13 @@ class HealthDaemon:
         except Exception as exc:  # noqa: BLE001
             lane.probe_note = type(exc).__name__
             return 0
-        if code == 429 and netutil.UPSTREAM_DOWN in body:
-            """opencode is down, not the exit: no verdict about this lane"""
-            lane.probe_note = "opencode down"
-            return 0
+        if code == 429:
+            # which section
+            if netutil.UPSTREAM_UNAVAILABLE in body:
+                lane.probe_note = "opencode down"
+                return 0
+            lane.probe_reason = (FREE_LIMIT if netutil.QUOTA_SPENT in body
+                                 else RATE_LIMIT)
         try:
             c2, body = netutil.https_get_via_socks(
                 lane.socks_port, "check.torproject.org", "/api/ip",
@@ -136,14 +149,7 @@ class HealthDaemon:
                     or not lane.healthy):
                 self._revive(lane)
                 continue
-            """
-            Nothing listening on the lane's own SOCKS port is a lane that
-            is down, however alive its process handle still looks: its tor
-            died, or its port moved out from under it. Probing would only
-            report that nothing came back -- which is deliberately not a
-            verdict -- so such a lane was never revived and never served
-            again while its request bounced off a closed port.
-            """
+            # dead port
             if not netutil.port_is_open("127.0.0.1", lane.socks_port,
                                         timeout=netutil.PORT_CHECK_TIMEOUT):
                 lane.probe_code = -1
@@ -151,12 +157,11 @@ class HealthDaemon:
                 continue
             if lane.asked:
                 continue
-            """Every lane carries every call now, so every lane is judged."""
             code = self.reachable(lane)
             if code == 429:
                 #: burnt
                 self.tor.note_result(lane.exit_country, code)
-                self.on_refused(lane, code)
+                self.refuse(lane, code)
                 continue
             if code in PROBE_VERDICTS:
                 lane.asked = True
@@ -176,13 +181,41 @@ class HealthDaemon:
                     + (f" ({note})" if note else "")
                     + " -- not a verdict, re-asking next sweep")
 
-    def on_refused(self, lane: Lane, status: int = 429) -> None:
-        """A real 429 from the far end: move this lane to a different country."""
+    def refuse(self, lane: Lane, status: int = 429) -> None:
+        """A 429 the probe saw through this lane: write it off, then move it.
+
+        A call that was refused writes its exit off itself, because only there
+        is the far end's own wait and section in hand; this is for the paths
+        that asked the lane directly -- the boot check, the demo and the health
+        sweep -- where ``reachable`` has already read the reason off the reply.
+        """
         if status != 429:
             # no signal
             return
-        if lane.limited_until <= time.time():
-            self.tor.note_limited(lane)
+        self.tor.note_limited(lane, reason=lane.probe_reason or RATE_LIMIT)
+        self.on_refused(lane, status)
+
+    def on_refused(self, lane: Lane, status: int = 429,
+                   fingerprint: str = "") -> None:
+        """A real 429 from the far end: move this lane off the exit it hit.
+
+        ``fingerprint`` names the exit the refusal came from, which is not
+        always the one the lane rides by now: a copy already in flight when its
+        lane moved reports on the exit it dialled, and the exit that moved the
+        lane came in first.  Moving again on that stale verdict would cost a
+        country rotation and a recook for nothing, so a lane that has already
+        left the refused exit is left where it is.
+        """
+        if status != 429:
+            # no signal
+            return
+        exit_fp = fingerprint or lane.exit_fingerprint
+        if exit_fp and exit_fp != lane.exit_fingerprint:
+            # left already
+            return
+        #: one move
+        if not self.tor.claim_move(lane):
+            return
         moved = self.tor.rotate_exit_country(lane)
         if self.tor.restart_lane(lane):
             self._emit_lane(
@@ -191,14 +224,7 @@ class HealthDaemon:
                 f"{{{moved or lane.exit_country}}}")
 
     def _revive(self, lane: Lane) -> None:
-        """Bring a down lane back, and say so either way.
-
-        Only a successful revive used to be reported. A lane that could
-        never come back -- because a tor that outlived its stop still held
-        the lane's data directory -- therefore looked exactly like a lane
-        that was simply never needed, and the failure stayed invisible for
-        a whole session.
-        """
+        """Bring a down lane back, and say so either way."""
         if self.tor.restart_lane(lane):
             lane.down_reported = False
             self._emit_lane(
@@ -212,8 +238,88 @@ class HealthDaemon:
                 f"lane {lane.index} is down -- could not bring it back")
 
     def _emit_lane(self, lane: Lane, kind: str, message: str) -> None:
-        self._emit({
-            "type": "lane", "kind": kind, "t": time.time(),
-            "lane": lane.index, "cc": lane.exit_country,
-            "ip": lane.exit_ip, "msg": message,
-        })
+        _lane_event(self._emit, lane, kind, message)
+
+
+class ExitSweep:
+    """Rotates idle lanes onto fresh exits, so our own calls spread out."""
+
+    def __init__(
+        self,
+        tor: TorManager,
+        event: Optional[Callable[[Dict], None]] = None,
+        log: Optional[Callable[..., None]] = None,
+        interval: float = SWEEP_S,
+    ) -> None:
+        self.tor = tor
+        self.interval = interval
+        self._emit = event or (lambda e: None)
+        self.log = log or (lambda *a, **k: None)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._loop, name="exit-sweep", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.step()
+            except Exception as exc:  # noqa: BLE001
+                self.log("sweep: cycle flamed out: %s", exc)
+            self._stop.wait(self.interval)
+
+    def step(self) -> None:
+        """Move one idle lane onto the freshest exit its country can give.
+
+        A lane that is sitting out a spent exit goes first: that is the pool
+        coming back, and it costs nothing to ask a lane that is carrying
+        nothing to re-pin itself.  A move that fails is not a reason to stop,
+        so the next idle lane gets its turn -- otherwise one lane whose tor
+        will not co-operate would hold every other lane's rescue behind it.
+        """
+        if self.interval <= 0:
+            return
+        idle = self.tor.idle_lanes()
+        now = time.time()
+        benched = [l for l in idle if l.limited_until > now]
+        for lane in benched + [l for l in idle if l.limited_until <= now]:
+            if self._reaim(lane, lane.limited_until > now):
+                return             # one move
+
+    def _reaim(self, lane: Lane, sitting_out: bool = False) -> bool:
+        """Move one lane to another exit in its own country, if it has one."""
+        candidates = self.tor.sweep_candidates(lane.exit_country)
+        if not candidates:
+            return False           # empty pool
+        target = candidates[0]
+        if target.fingerprint == lane.exit_fingerprint:
+            return False           # already best
+        lane.healing = True
+        try:
+            moved = self.tor.move_exit(lane, target)
+        finally:
+            lane.healing = False
+        if not moved:
+            return False           # move refused
+        said = (f"lane {lane.index} {{{lane.exit_country}}} was sitting out a "
+                f"spent exit -- back on {target.ip}" if sitting_out
+                else f"lane {lane.index} {{{lane.exit_country}}} spread to "
+                     f"exit {target.ip}")
+        self._say(lane, "spread", said)
+        return True
+
+    def _say(self, lane: Lane, kind: str, message: str) -> None:
+        """The pane hears every exit we ask."""
+        _lane_event(self._emit, lane, kind, message)

@@ -1,11 +1,4 @@
-"""Loopback + SOCKS5 network helpers.
-
-Windows gives a console-mode child of a CONSOLE-LESS parent a brand new
-console, and a new console is a visible window, so every process this
-module runs -- tasklist and netstat -- passes CREATE_NO_WINDOW.
-Measured: 20 unflagged tasklist spawns from a console-less parent peaked
-at 2 visible console windows; the same 20 with the flag stayed at 1.
-"""
+"""Loopback + SOCKS5 network helpers"""
 
 from __future__ import annotations
 
@@ -21,6 +14,8 @@ import threading
 import time
 from typing import Optional, Container, Tuple
 
+from . import bounds
+
 PORT_CHECK_TIMEOUT = 1.0
 
 #: quiet spawns
@@ -31,9 +26,11 @@ def _quiet() -> dict:
     """creationflags that keep a console tool from opening a window."""
     return {"creationflags": _NO_WINDOW} if os.name == "nt" else {}
 
-"""opencode's own "endpoint unavailable" error body -- a 429 that is NOT
-the exit's limit"""
-UPSTREAM_DOWN = b'"server_error"'
+# opencode edge
+UPSTREAM_UNAVAILABLE = b'"server_error"'
+
+# free wall
+QUOTA_SPENT = b'"FreeUsageLimitError"'
 
 
 def _pid_alive_local(pid: int) -> bool:
@@ -57,13 +54,17 @@ _session_mutex = threading.Lock()
 _session_handles: dict[pathlib.Path, int] = {}
 
 
-def session_lock(data_dir: str) -> Optional[int]:
-    """Hold an OS lock until release; None acquired, pid/-1 busy, OSError failed.
+def chmod_quiet(path, mode: int) -> None:
+    """Restrict a file or directory; best effort, meaningful on POSIX only."""
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
 
-    The stable guard is never unlinked: removing a locked inode would let
-    another process lock a different file. The PID file remains compatible
-    with older running installs, but is not the synchronization primitive.
-    """
+
+def session_lock(data_dir: str) -> Optional[int]:
+    """Hold an OS lock until release; None acquired, pid/-1 busy, OSError failed."""
+    # lock guard
     path = pathlib.Path(data_dir).resolve() / "session.lock"
     with _session_mutex:
         if path in _session_handles:
@@ -125,7 +126,7 @@ def release_session_lock(data_dir: str) -> None:
             os.close(fd)
 
 #: circuit slots
-SOCKS_SLOTS = int(os.environ.get("LINGLING_SOCKS_SLOTS", "8"))
+SOCKS_SLOTS = bounds.count("LINGLING_SOCKS_SLOTS", 8, 1, 64)
 
 
 def slot_cred(lane_index: int, slot: int) -> Tuple[str, str]:
@@ -134,13 +135,8 @@ def slot_cred(lane_index: int, slot: int) -> Tuple[str, str]:
 
 
 def lane_cred(lane_index: int) -> Tuple[str, str]:
-    """The one circuit a lane's probe and its live traffic share.
-
-    Tor keys a circuit to the SOCKS username, so a credential that changes
-    per request makes Tor rebuild a three-hop circuit every call. Judging
-    the lane and then riding a different circuit spends the probe's warmth
-    on a circuit no request ever uses.
-    """
+    """The one circuit a lane's probe and its live traffic share."""
+    # circuit key
     return slot_cred(lane_index, 0)
 
 
@@ -161,7 +157,7 @@ def port_is_open(host: str, port: int, timeout: float = 0.2) -> bool:
 
 
 def bindable(port: int, host: str = "127.0.0.1") -> bool:
-    """True if a fresh socket can bind+listen -- catches Windows' excluded port ranges (Hyper-V/WSL) ..."""
+    """True if a fresh socket can bind+listen (Windows excluded port ranges)."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -221,6 +217,18 @@ def pids_on_ports(ports: Container[int]) -> dict:
     return found
 
 
+def abort_quiet(sock) -> None:
+    """Cut a connection loose, so a read blocked on it lets go at once."""
+    try:                    # stand-in sockets
+        sock.shutdown(socket.SHUT_RDWR)
+    except (OSError, AttributeError):
+        pass
+    try:
+        sock.close()
+    except (OSError, AttributeError):
+        pass
+
+
 def _recv_exact(sock: socket.socket, n: int,
                 deadline: Optional[float] = None) -> Optional[bytes]:
     """Exactly ``n`` bytes, or None if the peer closed early."""
@@ -269,8 +277,7 @@ def socks5_open(sock: socket.socket, host: str, port: int,
                 user, password = cred
                 ub = user.encode("utf-8")[:255]
                 pb = password.encode("utf-8")[:255]
-                send(bytes([0x01, len(ub)]) + ub
-                     + bytes([len(pb)]) + pb)
+                send(bytes([0x01, len(ub)]) + ub + bytes([len(pb)]) + pb)
                 auth = _recv_exact(sock, 2, deadline)
                 if auth is None or auth[0] != 0x01 or auth[1] != 0x00:
                     return "SOCKS5 auth refused"

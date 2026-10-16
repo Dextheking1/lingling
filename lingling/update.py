@@ -1,34 +1,4 @@
-"""Notice a newer lingling, and install it -- without breaking a launch.
-
-Three facts decide the shape of this module.
-
-*Nothing already installed can update itself.* A copy of lingling on a
-user's disk has exactly the code it was installed with, so a version
-that shipped no checker can never learn it is stale; the only thing
-that moves it is a person typing an upgrade. This module is therefore a
-bootstrap: the release that carries it reaches nobody new, and the
-release after it reaches everyone who took that one step by hand.
-
-*lingling is a console script, not a standalone binary.* On Windows
-``Scripts/lingling.exe`` is the file being executed at the same moment
-``pip install --upgrade`` wants to replace it, and Windows will not
-overwrite a running image. So the ordinary path does not install in
-place: it hands the job to a small detached helper that waits for this
-process to end and only then runs the installer. The upgrade therefore
-lands between two launches -- the only moment it is safe -- and a
-session in progress is never pulled out from under the user.
-
-*A launch must not pay for any of it.* The check is a background thread
-with hard timeouts, a disk cache with a TTL, and a negative cache so a
-dead endpoint is asked once an hour rather than once a launch. Offline,
-the thread dies quietly and the boot is exactly as long as it was
-before this module existed.
-
-The version comparison is hand-rolled because the only dependency this
-package declares is stem and cryptography, and pulling in ``packaging``
-to compare ``2.1.20.post23`` against ``2.1.21`` is not worth a new
-dependency the user has to carry.
-"""
+"""The update check against the published manifest, with no new dependency."""
 
 from __future__ import annotations
 
@@ -45,36 +15,26 @@ import urllib.request
 from pathlib import Path
 from typing import Optional, Sequence
 
-"""The manifest endpoint (a Vercel function, see tools/update-api/). It
-carries human-controlled fields a plain release cannot: a one-line
-notice, and the oldest build still known to work against current
-opencode. A release is the only way to change *code*; this is the
-only way to say something urgent before the next release lands."""
+# manifest url
 MANIFEST_URL = "https://lingling-update.vercel.app/api/latest"
 
-"""Fallback when the manifest is unreachable: the registry itself."""
+# fallback
 PYPI_URL = "https://pypi.org/pypi/lingling/json"
 
-"""The manifest format this build understands. An unknown schema is
-ignored rather than guessed at, so a future field cannot make an old
-client misread a newer manifest."""
+# format
 SCHEMA = 1
 
-"""How long a good answer is trusted, and how long a bad one is."""
+# cache ttl
 CACHE_TTL = 6 * 3600
 FAIL_TTL = 3600
 
-"""Bound on each request. The check rides a boot that takes minutes, so
-a slow endpoint is only ever a late line, never a late launch."""
+# request bound
 TIMEOUT = 3.0
 
-"""Bound on the whole check, so a pathological resolver cannot pin the
-thread past the point where the notice is worth printing."""
+# check bound
 BUDGET = 8.0
 
-"""How long the detached helper waits for us to exit before giving up.
-A session can legitimately run all day; after a day the upgrade is
-better left to the next launch than installed around a live kitchen."""
+# helper wait
 HELPER_WAIT = 24 * 3600
 
 CACHE_NAME = "update-check.json"
@@ -118,17 +78,26 @@ Nothing here is required: with the check off, lingling launches exactly
 as it did before this command existed.
 """
 
-"""The detached installer. It waits for the launcher that spawned it to
-die -- the file lock is on the running image, not on the package --
-and only then installs. ``os.kill(pid, 0)`` is deliberately not used:
-on Windows that call TERMINATES the process it is asked about, so the
-liveness check has to be the OS's own table."""
+# no os.kill
 _HELPER = r'''
 import os, subprocess, sys, time
 
 pid = int(sys.argv[1])
 cmd = sys.argv[2:]
-deadline = time.time() + float(os.environ.get("LINGLING_HELPER_WAIT", "86400"))
+
+
+def wait_seconds(raw):
+    """A week at most: a bad value waits the default rather than for ever."""
+    try:
+        value = float(raw or 86400)
+    except ValueError:
+        return 86400.0
+    if value != value or value < 0:
+        return 86400.0
+    return min(value, 7 * 86400)
+
+
+deadline = time.time() + wait_seconds(os.environ.get("LINGLING_HELPER_WAIT"))
 
 #: CREATE_NO_WINDOW, and it is not cosmetic. This helper has no console of
 #: its own (it is spawned DETACHED_PROCESS), and Windows hands every
@@ -218,15 +187,7 @@ def _safe_info(info: dict) -> dict:
 
 
 def key(version: str) -> tuple:
-    """An ordering key for lingling's own scheme: ``X.Y.Z[.postN]``.
-
-    PEP 440 puts a post release *after* the release it amends, so
-    ``2.1.20.post23`` is newer than ``2.1.20`` and older than
-    ``2.1.21``. A tuple does that in one comparison: the post release
-    sets a flag in slot three, and only ever competes inside the same
-    ``X.Y.Z``. Anything unparseable reads as zero, so a junk tag can
-    never outrank a real release.
-    """
+    """PEP 440 puts a post release after the release it amends."""
     text = _version_text(version)
     if text is None:
         return (0, 0, 0, 0, 0)
@@ -252,12 +213,7 @@ def is_newer(candidate: Optional[str], than: str) -> bool:
 
 
 def current_version() -> str:
-    """The version in this process, read per call so a test can swap it.
-
-    Importing the attribute rather than the value is the whole point:
-    a verify script can stand in a different version and exercise the
-    notice without a network or a second install.
-    """
+    """The version in this process, read per call so a test can swap it"""
     from . import __version__
     return __version__
 
@@ -267,12 +223,7 @@ def current_version() -> str:
 # ---------------------------------------------------------------------------
 
 def mode() -> str:
-    """``auto`` (default), ``notify``, or ``off`` -- read per call.
-
-    An explicit ``lingling update`` is not gated by this: asking for the
-    command is a direct instruction, and refusing to answer it because
-    the *launch* check is off would be a trap.
-    """
+    """``auto`` (default), ``notify``, or ``off`` -- read per call"""
     raw = (os.environ.get("LINGLING_UPDATE") or "").strip().lower()
     if raw in ("off", "0", "no", "false", "none", "disable", "disabled"):
         return "off"
@@ -288,11 +239,7 @@ def manifest_url() -> str:
 
 
 def _override_cmd() -> list:
-    """``LINGLING_UPDATE_CMD``, for installs that are not pip, pipx or uv.
-
-    Whitespace separated, with quotes honoured on Windows where an
-    interpreter path may contain a space.
-    """
+    """``LINGLING_UPDATE_CMD``, for installs that are not pip, pipx or uv"""
     raw = (os.environ.get("LINGLING_UPDATE_CMD") or "").strip()
     if not raw:
         return []
@@ -312,7 +259,6 @@ def _get_json(url: str, timeout: float):
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
     except Exception:  # noqa: BLE001
-        """offline, DNS, TLS, junk body, anything"""
         return None
 
 
@@ -332,9 +278,7 @@ def _lookup(timeout: float) -> dict:
             info["source"] = "manifest"
             if info["latest"]:
                 return info
-    """A manifest that is unreachable, or a schema we do not understand,
-    still leaves the registry -- which is the version users get when
-    they follow the install line in the README anyway."""
+    # registry stays
     doc = _get_json(PYPI_URL, timeout)
     if isinstance(doc, dict):
         registry = doc.get("info")
@@ -355,7 +299,7 @@ def read_cache(data_dir) -> Optional[dict]:
     try:
         doc = json.loads(_cache_path(data_dir).read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
-        """missing, unreadable, truncated"""
+        # bad cache
         return None
     return _safe_info(doc) if isinstance(doc, dict) else None
 
@@ -374,12 +318,7 @@ def _write_cache(data_dir, info: dict) -> None:
 
 
 def fresh(info: Optional[dict], now: Optional[float] = None) -> bool:
-    """Is this cached answer still worth acting on?
-
-    A negative answer expires sooner than a positive one: a dead
-    endpoint should be retried within the hour, while a version that is
-    genuinely the newest need only be confirmed occasionally.
-    """
+    """Is this cached answer still worth acting on?"""
     if not isinstance(info, dict):
         return False
     try:
@@ -416,18 +355,7 @@ def behind(info: Optional[dict], current: Optional[str] = None) -> bool:
 
 def notice_lines(info: Optional[dict], current: Optional[str] = None,
                  mode_name: Optional[str] = None, ask: bool = False) -> list:
-    """The lines worth printing, or an empty list to stay silent.
-
-    Silence is the default in every direction: up to date, unreachable,
-    unparseable, or switched off. The one case that is never silent is
-    a build below the manifest's floor -- that is lingling saying the
-    current opencode will not work with what you have.
-
-    ``ask`` drops the one claim that a question would contradict: when
-    the install is about to be offered, the notice names the versions
-    and stops, because whether it lands is the user's answer and not a
-    sentence this line gets to promise.
-    """
+    """The lines worth printing, or an empty list to stay silent"""
     if mode_name == "off" or not behind(info, current):
         return []
     info = _safe_info(info)
@@ -459,18 +387,10 @@ def notice_lines(info: Optional[dict], current: Optional[str] = None,
 
 
 # ---------------------------------------------------------------------------
-"""the launch-side check"""
 # ---------------------------------------------------------------------------
 
 class Check:
-    """A background check, and the answer when it arrives.
-
-    The spawn is deliberately dumb: one daemon thread, one deadline, and
-    every failure swallowed. The launcher asks once, at the moment it
-    hands the terminal over, and a check that has not finished by then
-    simply says nothing -- a late notice is worth less than a clean
-    handoff.
-    """
+    """A background check, and the answer when it arrives"""
 
     def __init__(self) -> None:
         self.info: Optional[dict] = None
@@ -481,10 +401,7 @@ class Check:
         def run() -> None:
             deadline = time.time() + BUDGET
             try:
-                """Housekeeping for a previous upgrade, off the boot path:
-                a launcher parked by an earlier install is still locked
-                until the process owning it exits, so the sweep belongs
-                to the next launch rather than the one that parked it."""
+                # old launcher
                 sweep_launcher_leftovers()
                 cached = read_cache(data_dir)
                 if fresh(cached):
@@ -514,7 +431,6 @@ def start(data_dir) -> Optional[Check]:
     try:
         return Check().start(data_dir)
     except Exception:  # noqa: BLE001
-        """a thread that will not start is not a launch failure"""
         return None
 
 
@@ -528,11 +444,7 @@ def _say(stream, line: str) -> None:
 
 
 def emit(check_obj: Optional[Check], stream=None, ask: bool = False) -> None:
-    """Say the one thing there is to say, or nothing at all.
-
-    stderr, because a notice is not this program's output: a script
-    reading stdout should not have to learn to ignore it.
-    """
+    """Say the one thing there is to say, or nothing at all"""
     if check_obj is None:
         return
     stream = stream or sys.stderr
@@ -552,12 +464,7 @@ def cached_hint(data_dir, stream=None) -> None:
 # ---------------------------------------------------------------------------
 
 def install_method() -> str:
-    """How this copy was installed: ``pipx``, ``uv``, or ``pip``.
-
-    Read off the running interpreter's prefix rather than off PATH: a
-    machine can have every one of these on it, and only the prefix says
-    which one owns the lingling being executed.
-    """
+    """How this copy was installed: ``pipx``, ``uv``, or ``pip``"""
     seen = []
     for attr in ("prefix", "base_prefix"):
         seen.append(str(getattr(sys, attr, "") or ""))
@@ -589,16 +496,7 @@ def upgrade_command() -> list:
 
 
 def scripts_dir() -> Path:
-    """Where pip put the console script.
-
-    ``sys.executable``'s own directory is NOT it. In a global install the
-    interpreter is ``...\\Python312\\python.exe`` and the launcher is in
-    ``...\\Python312\\Scripts\\`` -- measured on a real global install,
-    where the naive path resolved to a file that does not exist and the
-    whole lock-avoidance below silently did nothing. ``sysconfig`` is the
-    only thing that also gets a virtualenv right, because it answers in
-    terms of ``sys.prefix`` rather than of the interpreter's filename.
-    """
+    """sysconfig, not the interpreter's path: a global launcher lives in Scripts/."""
     try:
         import sysconfig
         path = sysconfig.get_path("scripts")
@@ -610,21 +508,7 @@ def scripts_dir() -> Path:
 
 
 def _running_launcher() -> Optional[Path]:
-    """``Scripts/lingling.exe`` when that file is *this* process's image.
-
-    Windows will not overwrite a running executable, so it is the one
-    file in the install that an in-place upgrade cannot replace. It can,
-    however, be renamed while it runs -- so it is parked out of the way
-    and the installer is free to write a fresh one.
-
-    The test is the *name* of ``argv[0]``, not its path. A pip console
-    script runs under a distlib launcher that reports the script without
-    its extension -- measured, ``argv[0]`` is ``...\\Scripts\\lingling``,
-    never ``...\\lingling.exe`` -- so comparing resolved paths never
-    matched. ``python -m lingling`` reports ``__main__.py`` and a ``-c``
-    run reports ``-c``, and both correctly skip parking: those processes
-    hold no lock on the launcher and pip can replace it freely.
-    """
+    """The test is the *name* of ``argv[0]``, not its path"""
     if os.name != "nt":
         return None
     exe = scripts_dir() / "lingling.exe"
@@ -635,13 +519,7 @@ def _running_launcher() -> Optional[Path]:
 
 
 def sweep_launcher_leftovers() -> None:
-    """Drop launchers parked by an earlier upgrade.
-
-    Best effort by design: a parked image is still locked until the
-    process that owns it exits, so this is for the *next* launch, a
-    failure is not worth a word to the user, and it runs on the check
-    thread rather than in front of the boot.
-    """
+    """Drop launchers parked by an earlier upgrade"""
     if os.name != "nt":
         return
     try:
@@ -655,13 +533,7 @@ def sweep_launcher_leftovers() -> None:
 
 
 def run_install(capture: bool = False, timeout: float = 600):
-    """Run the installer in this process. Returns ``(ok, output)``.
-
-    Only ``--now`` uses this. On Windows the launcher is parked first so
-    the install can land, and restored if it does not -- a failure here
-    must leave the user with exactly the machine they had, or with a
-    fresh launcher, never with no launcher at all.
-    """
+    """Run the installer in this process"""
     argv = upgrade_command()
     parked = None
     launcher = _running_launcher()
@@ -692,17 +564,13 @@ def run_install(capture: bool = False, timeout: float = 600):
 
     if parked is not None:
         if launcher.exists():
-            """An installer that wrote a fresh launcher has already done the
-            thing this parking existed for, so the parked one is dead
-            weight. Deleting it can still fail while it is the running
-            image; that is what the next launch's sweep is for."""
+            # dead weight
             try:
                 parked.unlink()
             except OSError:
                 pass
         else:
-            """Put it back, so a failed install is a no-op rather than a
-            machine where `lingling` no longer exists."""
+            # restore
             try:
                 os.replace(parked, launcher)
             except OSError:
@@ -723,50 +591,20 @@ def installed_version() -> Optional[str]:
         from importlib.metadata import version as _v
         return _v("lingling")
     except Exception:  # noqa: BLE001
-        """not installed as a distribution"""
         return None
 
 
 def helper_python() -> str:
-    """The interpreter the detached helper itself should run.
-
-    ``sys.executable`` is not always it. Under pipx -- and any venv --
-    ``Scripts/python.exe`` is a redirector stub: a small console program
-    that starts the real interpreter as its OWN child, and a console
-    child of a console-less parent is handed a brand new console.
-    Measured here, the same detached sleep: through the venv stub it
-    opened a visible terminal window, through the base interpreter it
-    opened none. The stub is the process that receives DETACHED_PROCESS,
-    so the flag is spent on the one process that cannot flash while its
-    child -- the one that polls for the whole session -- gets a window.
-    That is the field report this module already fixed once, back again
-    for every pipx user.
-
-    ``_base_executable`` is that real interpreter, and the helper needs
-    nothing but the standard library, so nothing else moves: the
-    installer argv was built in *this* process and still names
-    ``sys.executable``, which is how the install lands in the venv that
-    owns lingling instead of somewhere else.
-    """
+    """The interpreter the detached helper itself should run"""
     base = getattr(sys, "_base_executable", "") or ""
     if base and base != sys.executable and os.path.isfile(base):
         return base
     return sys.executable or "python"
 
 
-"""CreateProcess flags for the detached installer."""
+# installer flags
 #:
-"""DETACHED_PROCESS gives it no console, CREATE_NEW_PROCESS_GROUP keeps a
-Ctrl+C in the session from reaching it, and CREATE_BREAKAWAY_FROM_JOB is
-the one that actually matters. lingling joins a KILL_ON_JOB_CLOSE job as
-soon as its first lane starts (``winjob.ensure_kill_job``), and Windows
-drags every child of a job member into that job whether the child asks or
-not -- so without breakaway the helper is terminated at the instant
-lingling exits, which is exactly when it is supposed to run pip. The
-install then silently never happens, while the log still cheerfully says
-it was scheduled. Breakaway requires the job to permit it, which is why
-``winjob`` sets JOB_OBJECT_LIMIT_BREAKAWAY_OK; a third-party job that
-forbids it rejects this spawn outright, and the retry below covers that."""
+# no console
 _DETACHED = 0x00000008
 _NEW_GROUP = 0x00000200
 _BREAKAWAY = 0x01000000
@@ -782,17 +620,7 @@ def _detach_kwargs(breakaway: bool = True) -> dict:
 
 
 def spawn_deferred(data_dir, delay: Optional[float] = None):
-    """Hand the install to a helper that waits for us to exit.
-
-    Returns the helper's pid, or None when nothing was scheduled. This
-    is the default path precisely because of the lock described in
-    :func:`_running_launcher`: the one file an upgrade must replace is
-    the one file that cannot be replaced while lingling runs.
-
-    The helper must also outlive our process *group*, not just our pid:
-    it breaks away from the kill job (see :data:`_BREAKAWAY`), without
-    which the job terminates it on close and the install never runs.
-    """
+    """Hand the install to a helper that waits for us to exit"""
     argv = upgrade_command()
     if not argv:
         return None
@@ -814,7 +642,7 @@ def spawn_deferred(data_dir, delay: Optional[float] = None):
                 **_detach_kwargs(breakaway))
             break
         except Exception:  # noqa: BLE001
-            """a job may forbid breakaway"""
+            # no breakaway
             proc = None
     if proc is None:
         try:
@@ -836,58 +664,31 @@ def spawn_deferred(data_dir, delay: Optional[float] = None):
 # the question
 # ---------------------------------------------------------------------------
 
-"""The question, asked at the handoff when an update is waiting and there
-is a terminal to ask on. Enter installs, which is also what the
-unattended path does -- so the default never strands a user on a
-question they did not expect, and never costs them a version either."""
+# handoff ask
 PROMPT = "  install it when this session ends? [Y/n] "
 
-"""What a ``no`` says. One line, and it names both ways to get the
-install later -- otherwise "skipped" reads as "never", and the next
-launch asks again with no way to make it stop."""
 SKIP_LINE = ("  ok -- skipped: `lingling update` installs it when you want, "
              "and LINGLING_UPDATE=notify stops the question")
 
 
-"""A ``no``, in the shapes a person actually types."""
+# no shapes
 _NO = ("n", "no")
 
 
 def _console_stdin() -> bool:
-    """Will the OS really deliver a keystroke to this process's stdin?
-
-    ``isatty`` is not that question on Windows. Measured under a shell
-    whose stdin is an MSYS pty: ``sys.stdin.isatty()`` is True while
-    ``GetConsoleMode`` fails, ``msvcrt.kbhit()`` answers False rather
-    than raising, and the first ``input()`` raises EOFError -- so a
-    launch there would print a question, read nothing, and take the EOF
-    as a no, silently dropping an update in a launch that worked fine
-    before this question existed. Only a live console handle is asked
-    for an answer, and anything else falls back to installing after the
-    session, which is the behaviour every build has shipped with.
-    """
+    """Will the OS really deliver a keystroke to this process's stdin?"""
     try:
         import ctypes
         kernel32 = ctypes.windll.kernel32
         return bool(kernel32.GetConsoleMode(
             kernel32.GetStdHandle(-10), ctypes.byref(ctypes.c_uint())))
     except Exception:  # noqa: BLE001
-        """no ctypes, no console, no question"""
+        # no ctypes
         return False
 
 
 def _at_terminal(stdout=None) -> bool:
-    """Are both ends of the question a terminal, one that can answer?
-
-    Both, not either. Somebody who runs ``lingling | tee log`` or drives
-    it from a script has handed one of the streams to another program,
-    and that program never agreed to answer a question written into its
-    input. A launch that cannot be asked is simply installed after, the
-    way it always was.
-
-    ``stdout`` is a seam, and the only one here: the test that pins the
-    Windows console rule has to ask this question without a terminal.
-    """
+    """Are both ends of the question a terminal, one that can answer?"""
     out = sys.stdout if stdout is None else stdout
     try:
         if not out.isatty():
@@ -896,20 +697,12 @@ def _at_terminal(stdout=None) -> bool:
             return _console_stdin()
         return bool(sys.stdin.isatty())
     except Exception:  # noqa: BLE001
-        """a stream with no isatty at all"""
+        # no isatty
         return False
 
 
 def _pending_input() -> bool:
-    """Is a keystroke already waiting? Peek, never consume it.
-
-    Launches get typed into: people queue their first question while the
-    lanes warm. Reading that line to answer this one would hand opencode
-    an empty prompt instead, so when one is waiting the question is not
-    asked at all. The peek is non-destructive on purpose; the exception
-    path answers "yes, something is there", because the alternative to a
-    mis-read is losing the user's first sentence.
-    """
+    """Is a keystroke already waiting?"""
     try:
         if os.name == "nt":
             import msvcrt
@@ -917,35 +710,24 @@ def _pending_input() -> bool:
         import select
         return bool(select.select([sys.stdin], [], [], 0)[0])
     except Exception:  # noqa: BLE001
-        """no console to ask"""
+        # no console
         return True
 
 
 def askable(info: Optional[dict] = None) -> bool:
-    """Is there someone at a terminal who can answer, right now?
-
-    Three quiet noes, and each one of them is the old behaviour rather
-    than a failure: the mode does not install, there is nothing to
-    install, or there is no terminal (or someone is already typing).
-    """
+    """Is there someone at a terminal who can answer, right now?"""
     if mode() != "auto" or not behind(info):
         return False
     return _at_terminal() and not _pending_input()
 
 
 def _ask(prompt: str, stream) -> str:
-    """Write the prompt, then read one line from the terminal.
-
-    Blocking, and that is the point: this runs at the handoff, when the
-    terminal is ours for a few seconds and the lanes are already hot. A
-    question that scrolls past unanswered is worse than one that waits.
-    Ctrl-C or a closed stdin reads as no, and the session still starts.
-    """
+    """Write the prompt, then read one line from the terminal"""
     try:
         stream.write(prompt)
         stream.flush()
     except Exception:  # noqa: BLE001
-        """nowhere to ask means no"""
+        # no ask
         return "n"
     try:
         return input()
@@ -956,16 +738,7 @@ def _ask(prompt: str, stream) -> str:
 
 def auto_install(data_dir, info: Optional[dict], ask: bool = False,
                  read=None, stream=None) -> Optional[int]:
-    """Schedule the deferred install when the mode says to.
-
-    Called once per launch, so one upgrade per session at most. With
-    ``ask``, the person at the terminal decides first: Enter or ``y``
-    installs it once this session ends, ``n`` leaves it to
-    ``lingling update``. Any other answer -- including the timeout-free
-    blocking read being interrupted -- keeps the install, because the
-    default has always been to keep up and a keystroke at the handoff
-    must never be a way to silently lose an upgrade.
-    """
+    """Schedule the deferred install when the mode says to"""
     if mode() != "auto" or not behind(info):
         return None
     if ask:
@@ -978,7 +751,7 @@ def auto_install(data_dir, info: Optional[dict], ask: bool = False,
 
 
 # ---------------------------------------------------------------------------
-"""the explicit command"""
+# explicit cmd
 # ---------------------------------------------------------------------------
 
 def _report(current: str, info: dict, stream=None) -> None:
@@ -1003,9 +776,7 @@ def update_command(rest: Sequence[str]) -> int:
     if "--help" in args or "-h" in args:
         print(UPDATE_HELP)
         return 0
-    """Cheap housekeeping, and the right moment for it: a launcher parked by
-    an earlier `--now` was locked by the process that parked it, so this
-    run is the first that can actually delete it."""
+    # first run
     sweep_launcher_leftovers()
     check_only = "--check" in args
     now = "--now" in args
@@ -1017,8 +788,7 @@ def update_command(rest: Sequence[str]) -> int:
     _report(current, info)
 
     if not info.get("latest"):
-        """Silence is right on a launch and a lie in an explicit command:
-        "nothing to do" must never stand in for "I could not look"."""
+        # silence
         print("  could not reach the update servers -- nothing was changed.")
         print("  install by hand:  " + " ".join(upgrade_command()))
         return 1

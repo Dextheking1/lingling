@@ -4,7 +4,7 @@ from __future__ import annotations
 import ipaddress
 import pathlib
 import random
-from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 #: worldwide exits
 WORLD_CC = frozenset([
@@ -106,16 +106,49 @@ def find_consensus(lanes_dir: pathlib.Path) -> Optional[pathlib.Path]:
     return None
 
 
-def claim(by_country: Dict[str, List[Exit]], country: str,
-          avoid: Sequence[str], limited: Dict[str, float],
-          used: Dict[str, float], now: float) -> Optional[Exit]:
-    """A relay in ``country`` that no lane holds and nothing has limited."""
+def limited_until(entry: Any) -> float:
+    """A notepad entry's expiry, in either the current or the older shape."""
+    if isinstance(entry, dict):
+        entry = entry.get("until")
+    try:
+        return float(entry)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _open(relays: Sequence[Exit], avoid: Sequence[str],
+          limited: Dict[str, Any], now: float) -> List[Exit]:
+    """The relays no lane holds, and nothing has written off."""
     held = set(avoid)
-    pool = [e for e in by_country.get(country.upper(), ())
+    return [e for e in relays
             if e.fingerprint not in held
-            and limited.get(e.fingerprint, 0.0) <= now]
+            and limited_until(limited.get(e.fingerprint, 0.0)) <= now]
+
+
+def claim(by_country: Dict[str, List[Exit]], country: str,
+          avoid: Sequence[str], limited: Dict[str, Any],
+          used: Dict[str, float], now: float,
+          verified: Optional[Dict[str, float]] = None) -> Optional[Exit]:
+    """A relay in ``country`` that no lane holds and nothing has limited."""
+    fresh = verified or {}
+    pool = _open(by_country.get(country.upper(), ()), avoid, limited, now)
     if not pool:
         return None
-    #: freshness
-    pool.sort(key=lambda e: (used.get(e.fingerprint, 0.0), -e.bandwidth))
+    #: verified lead
+    pool.sort(key=lambda e: (0 if fresh.get(e.fingerprint, 0.0) > now else 1,
+                             used.get(e.fingerprint, 0.0), -e.bandwidth))
     return pool[0]
+
+
+def sweep_order(by_country: Dict[str, List[Exit]], country: str,
+                avoid: Sequence[str], limited: Dict[str, Any],
+                used: Dict[str, float], verified: Dict[str, float],
+                now: float) -> List[Exit]:
+    """Relays in ``country`` worth rotating onto, a verified one first."""
+    pool = _open(by_country.get(country.upper(), ()), avoid, limited, now)
+    #: verified first
+    return sorted(pool,
+                  key=lambda e: (0 if verified.get(e.fingerprint, 0.0) > now
+                                  else 1,
+                                  used.get(e.fingerprint, 0.0),
+                                  random.random()))  # spread tiebreak

@@ -1,4 +1,4 @@
-"""Local rotating CONNECT relay in front of OpenCode: picks the least-loaded healthy lane, tunnels ..."""
+"""Local rotating CONNECT relay in front of opencode, over the lanes."""
 
 from __future__ import annotations
 
@@ -10,16 +10,16 @@ import threading
 import time
 from typing import Callable, Dict, List, Optional
 
-from . import netutil
+from . import bounds, netutil
 from .lanes import Lane, TorManager
 
 #: connection cap
-_MAX_CONNS = int(os.environ.get("LINGLING_MAX_CONNS", "256"))
+_MAX_CONNS = bounds.count("LINGLING_MAX_CONNS", 256, 1, 4096)
 
 #: losing country
-_LOSING = int(os.environ.get("LINGLING_LOSING_SCORE", "-2"))
+_LOSING = bounds.count("LINGLING_LOSING_SCORE", -2, -1000, 1000)
 #: thin pool
-_LOSING_MIN_POOL = int(os.environ.get("LINGLING_LOSING_MIN_POOL", "4"))
+_LOSING_MIN_POOL = bounds.count("LINGLING_LOSING_MIN_POOL", 4, 0, 256)
 
 
 class Relay:
@@ -37,7 +37,8 @@ class Relay:
         self._emit = event or (lambda e: None)
         self.dial_timeout = dial_timeout
         #: never 502
-        self.wait_budget = float(os.environ.get("LINGLING_LANE_WAIT", "90"))
+        self.wait_budget = bounds.number("LINGLING_LANE_WAIT", 90,
+                                        0.0, bounds.WINDOW_S)
         self._server: Optional[asyncio.AbstractServer] = None
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -103,11 +104,7 @@ class Relay:
     def _shutdown(self) -> None:
         if self._server:
             self._server.close()
-        """
-        Idle keep-alive tunnels live as pending tasks; stopping the loop
-        under them prints "Task was destroyed but it is pending" at exit,
-        so they are cancelled first.
-        """
+        # cancel tunnels
         for task in asyncio.all_tasks(self._loop):
             if task is not asyncio.current_task(self._loop):
                 task.cancel()
@@ -230,18 +227,22 @@ class Relay:
         lane.last_real_at = time.time()
         return lane
 
-    def report_refused(self, lane: Lane, status: int) -> None:
-        """403 or 429 -- the far end refused this exit."""
+    def report_refused(self, lane: Lane, status: int,
+                       fingerprint: str = "") -> None:
+        """403 or 429 -- the far end refused this exit.
+
+        ``fingerprint`` is the exit the refusal came from, which is not always
+        the one the lane rides by now: the hook needs it to write off the right
+        relay and to leave a lane that has already moved alone.
+        """
         # score it
         self.tor.note_result(lane.exit_country, status)
         if self.tor.limit_hook is not None:
             try:
-                self.tor.limit_hook(lane, status)
+                self.tor.limit_hook(lane, status, fingerprint)
             except Exception as exc:  # noqa: BLE001
-                """Moving a lane is upkeep, not the request: the client
-                already made its call, so nothing a hook does here may
-                end in a traceback and a dropped connection. It did, on
-                a plain 429 whose relaunch hit a broken control probe."""
+                # hook guard
+                # been made
                 self._emit({
                     "type": "lane", "kind": "fail", "t": time.time(),
                     "lane": lane.index, "cc": lane.exit_country,
@@ -386,7 +387,7 @@ class Relay:
     async def _dial(self, lane: Lane, host: str, port: int,
                     cred: Optional[tuple] = None
                     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        """SOCKS5 CONNECT to (host, port) through the lane; atyp=0x03 so DNS resolves at the exit -- the exit ..."""
+        """SOCKS5 CONNECT to (host, port) through the lane, DNS at the exit."""
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection("127.0.0.1", lane.socks_port),
             timeout=self.dial_timeout)

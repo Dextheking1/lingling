@@ -1,4 +1,4 @@
-"""Per-request MITM for opencode.ai: a local CA terminates TLS so each model call is visible, then ..."""
+"""Per-request MITM for opencode.ai: a local CA terminates TLS per call."""
 
 from __future__ import annotations
 
@@ -13,41 +13,70 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from . import netutil
+from . import bounds, netutil
+from .bench import FREE_LIMIT, RATE_LIMIT
 from .lanes import Lane
 
 #: unwrapped hosts
 MITM_HOSTS = ("opencode.ai",)
 
 #: the dial
-_FIRST_BYTE_TIMEOUT = float(os.environ.get("LINGLING_FIRST_BYTE_S", "30"))
+_FIRST_BYTE_TIMEOUT = bounds.number("LINGLING_FIRST_BYTE_S", 30,
+                                    bounds.TICK_S, bounds.WINDOW_S)
 #: the send
-_SEND_TIMEOUT = float(os.environ.get("LINGLING_SEND_S", "120"))
+_SEND_TIMEOUT = bounds.number("LINGLING_SEND_S", 120,
+                              bounds.TICK_S, bounds.WINDOW_S)
 #: pre-commit idle
-_READ_TIMEOUT = float(os.environ.get("LINGLING_STREAM_TIMEOUT", "1800"))
+_READ_TIMEOUT = bounds.number("LINGLING_STREAM_TIMEOUT", 1800,
+                              bounds.TICK_S, bounds.WINDOW_S)
 #: post-commit idle
-_STREAM_IDLE_TIMEOUT = float(os.environ.get("LINGLING_STREAM_IDLE_S", "1800"))
+_STREAM_IDLE_TIMEOUT = bounds.number("LINGLING_STREAM_IDLE_S", 1800,
+                                     bounds.TICK_S, bounds.WINDOW_S)
+#: first content
+_FIRST_CONTENT_TIMEOUT = bounds.number("LINGLING_FIRST_CONTENT_S", 30,
+                                       bounds.TICK_S, bounds.WINDOW_S)
+#: committed stall
+_STALL_CUT_S = bounds.number("LINGLING_STALL_CUT_S", 120,
+                             bounds.TICK_S, bounds.WINDOW_S)
+#: pane heartbeat
+_PULSE_S = bounds.number("LINGLING_PULSE_S", 60,
+                         bounds.TICK_S, bounds.WINDOW_S)
+#: race width
+_RACE_WIDTH = bounds.count("LINGLING_RACE_WIDTH", 0, 0, 64)
 #: slow exit
-_SLOW_EXIT_S = float(os.environ.get("LINGLING_SLOW_EXIT_S", "20"))
+_SLOW_EXIT_S = bounds.number("LINGLING_SLOW_EXIT_S", 20,
+                             bounds.TICK_S, bounds.WINDOW_S)
 #: first event
 _FIRST_EVENT = b"data:"
 #: idle tunnel
-_KEEPALIVE_S = float(os.environ.get("LINGLING_KEEPALIVE_S", "600"))
+_KEEPALIVE_S = bounds.number("LINGLING_KEEPALIVE_S", 600,
+                             bounds.TICK_S, bounds.WINDOW_S)
 
 #: retryable
 _RETRYABLE = frozenset({429, 502, 503, 504})
 #: 5xx attempts
 _5XX_ATTEMPTS = 2
+#: limit waves
+_LIMIT_WAVES = bounds.count("LINGLING_LIMIT_WAVES", 2, 0, 16)
+#: limit wait
+_LIMIT_WAIT_S = bounds.number("LINGLING_LIMIT_WAIT_S", 2.0,
+                             0.0, bounds.WINDOW_S)
 #: note bytes
 _NOTE_BYTES = 512
 
 #: cut capture
 _CAPTURE = os.environ.get("LINGLING_CAPTURE", "")
 #: capture bytes
-_CAPTURE_MAX = int(os.environ.get("LINGLING_CAPTURE_BYTES", "8192"))
+_CAPTURE_MAX = bounds.count("LINGLING_CAPTURE_BYTES", 8192, 0, 1_048_576)
 
 #: pre-commit cap
 _PRE_COMMIT_MAX = 65536
+
+#: hop headers
+_HOP_BY_HOP = frozenset({"connection", "keep-alive", "proxy-authenticate",
+                         "proxy-authorization", "te", "trailer",
+                         "transfer-encoding", "upgrade", "content-length",
+                         "expect"})
 
 _ca_lock = threading.Lock()
 _ca_ctx: Dict[Path, "tuple"] = {}  #: ca cache
@@ -72,6 +101,7 @@ def _ensure_ca(mitm_dir: Path):
     from cryptography.x509.oid import NameOID
 
     mitm_dir.mkdir(parents=True, exist_ok=True)
+    netutil.chmod_quiet(mitm_dir, 0o700)
     cert_path = mitm_dir / "ca.pem"
     key_path = mitm_dir / "ca-key.pem"
     if cert_path.exists() and key_path.exists():
@@ -103,6 +133,7 @@ def _ensure_ca(mitm_dir: Path):
         serialization.Encoding.PEM,
         serialization.PrivateFormat.TraditionalOpenSSL,
         serialization.NoEncryption()))
+    netutil.chmod_quiet(key_path, 0o600)  # CA key
     return cert, key, cert_path
 
 
@@ -114,6 +145,7 @@ class CertShop:
             self._ca_cert, self._ca_key, self.ca_pem_path = _ensure_ca(mitm_dir)
         self._dir = mitm_dir / "certs"
         self._dir.mkdir(parents=True, exist_ok=True)
+        netutil.chmod_quiet(self._dir, 0o700)
 
     def context_for(self, host: str) -> ssl.SSLContext:
         from cryptography import x509
@@ -147,6 +179,7 @@ class CertShop:
                 serialization.Encoding.PEM,
                 serialization.PrivateFormat.TraditionalOpenSSL,
                 serialization.NoEncryption()))
+            netutil.chmod_quiet(key_path, 0o600)  # leaf key
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(str(cert_path), str(key_path))
         return ctx
@@ -214,7 +247,7 @@ def _model_of(body: bytes) -> str:
 
 
 def _force_connection_close(head: bytes) -> bytes:
-    """Always advertise ``Connection: close``: safest contract for a proxy that may drop the tunnel ..."""
+    """Always advertise ``Connection: close`` on the upstream request."""
     lines = head.split(b"\r\n")
     out = [lines[0]]
     replaced = False
@@ -262,34 +295,80 @@ def _grab_lane(relay, tried: set):
 
 
 def _race_lanes(relay, tried: set) -> List[Lane]:
-    """Every lane that can still serve this call, the favorite first.
-
-    Racing all of them is the point: a request used to ride one lane and
-    wait behind that lane's queue while the other four sat idle.
-    """
+    """Every live lane that can serve this call, the favorite first."""
+    # spent exits
+    now = time.time()
     lanes: List[Lane] = []
     taken = set(tried)
+    spare: Optional[Lane] = None
+    same_exit: Optional[Lane] = None
+    exits: Dict[str, int] = {}
+
+    def live(lane) -> bool:
+        return lane.limited_until <= now
+
+    def exit_key(lane) -> str:
+        """What the far end counts this lane's allowance against."""
+        ip = (lane.exit_ip or "").strip()
+        if ip and ip != "?":
+            return ip
+        return lane.exit_fingerprint or ""
+
+    def shares_an_exit(lane) -> bool:
+        """True when a lane already in this wave sits on that exit."""
+        key = exit_key(lane)
+        return bool(key) and key in exits
+
     first = _grab_lane(relay, taken)
+    if first is not None and not live(first):
+        spare = first
+        first = None
     if first is not None:
         lanes.append(first)
         taken.add(first.index)
-    while True:
+        key = exit_key(first)
+        if key:
+            exits[key] = first.index
+    while _RACE_WIDTH <= 0 or len(lanes) < _RACE_WIDTH:
         lane = relay.pick_lane(exclude=taken)
         if lane is None or lane.index in taken:
             break
         taken.add(lane.index)
-        if lane.limited_until > time.time():
-            """Burnt: leave it out, and keep looking for a live lane."""
+        if not live(lane):
+            # burnt
+            continue
+        if _RACE_WIDTH > 0 and shares_an_exit(lane):
+            # one exit
+            if same_exit is None:
+                same_exit = lane
             continue
         lanes.append(lane)
+        key = exit_key(lane)
+        if key:
+            exits[key] = lane.index
+    if same_exit is not None and (_RACE_WIDTH <= 0
+                                  or len(lanes) < _RACE_WIDTH):
+        # second circuit
+        lanes.append(same_exit)
+    if not lanes and spare is not None:
+        lanes.append(spare)
     return lanes
 
 
 class _Copy:
-    """One lane's go at one call: cuttable from the thread that won."""
+    """One lane's go at one call: cuttable from the thread that won.
+
+    It also remembers the exit it dialled.  A lane can be moved onto another
+    relay while a copy is still in flight, so a verdict has to name the exit it
+    came from: that is the relay the far end counted, not the one the lane
+    happens to ride by the time the answer is read.
+    """
 
     def __init__(self, lane: Lane) -> None:
         self.lane = lane
+        #: dialled exit
+        self.exit_fp = lane.exit_fingerprint
+        self.exit_ip = lane.exit_ip
         self.race: Optional[_Race] = None
         self.thread: Optional[threading.Thread] = None
         self.sock = None
@@ -330,12 +409,7 @@ class _Beaten(Exception):
 
 
 class _Race:
-    """One call over every lane: the first answer to commit takes the client.
-
-    Nothing reaches the client until a copy commits, so a loser is cut
-    before it says a word -- and a loser is never a verdict about its lane,
-    because a hand of ours closed it.
-    """
+    """One call over every lane: the first answer to commit takes the client"""
 
     def __init__(self, copies: List[_Copy]) -> None:
         self.copies = copies
@@ -363,8 +437,8 @@ class _Race:
             try:
                 other.beat()
             except Exception:  # noqa: BLE001
-                """Cutting a loser is housekeeping: a loser that cannot be
-                cut must never cost the winner the client."""
+                # loser cut
+                pass
         return True
 
     def raced(self) -> int:
@@ -387,12 +461,7 @@ class _Round:
 def _race_call(client, lanes: List[Lane], host: str, port: int, method: str,
                path: str, headers: dict, body: bytes, emit, seq: int,
                call_n: int, t0: float, relay, model: str = "") -> _Round:
-    """Fire one call at every lane at once; the first answer takes the client.
-
-    The copies only talk to the pane through the race, so a loser is
-    silent. A dead exit is charged once per call -- by the first copy, or
-    by the copy that won and then had its own stream cut.
-    """
+    """Fire one call at every lane at once; the first answer takes the client"""
     copies = [_Copy(lane) for lane in lanes]
     race = _Race(copies)
     plain = len(lanes) == 1
@@ -432,9 +501,6 @@ def _race_call(client, lanes: List[Lane], host: str, port: int, method: str,
         copy.thread = thread
         thread.start()
     try:
-        """A round ends when a copy wins, or when every copy has given up.
-        Only the winner is waited on to the end; a loser is cut loose, and
-        a copy still dialling is left to notice on its own."""
         while race.winner is None and any(t.is_alive() for t in threads):
             time.sleep(0.05)
         winner = race.winner
@@ -453,29 +519,37 @@ def _race_call(client, lanes: List[Lane], host: str, port: int, method: str,
     return _tally(race, out, relay)
 
 
+def _note_ok(relay, lane) -> None:
+    """A real 200 through an exit: it earns a free verification stamp."""
+    note = getattr(relay.tor, "note_verified", None)
+    if note is not None:
+        note(lane.exit_fingerprint)
+
+
 def _tally(race: _Race, out: List[tuple], relay) -> _Round:
     """Judge a race: the client's answer, or what the copies earned."""
     got = _Round()
     for copy, (err, status, body, retryable) in out:
         if race.winner is copy:
-            """The copy that reached the client: score the exit it rode."""
             relay.tor.note_result(copy.lane.exit_country, status)
+            if status == 200:
+                _note_ok(relay, copy.lane)
             continue
         if err:
             if copy.beaten:
-                """A hand of ours cut it: never a verdict, never a retry."""
+                # our cut
                 continue
             got.retryable = got.retryable or retryable
             continue
         if status == 429:
-            limit, wait = _limit_of(body)
-            if limit:
-                got.limits.append((copy.lane, wait))
+            section, wait = _limit_of(body)
+            if section:
+                got.limits.append((copy.lane, copy.exit_fp, wait, section))
                 got.retryable = True
                 if not got.held:
                     got.held = body
                 continue
-            """The far end's own 429: no lane will do better at all."""
+            # far end
             got.refused = True
             got.held = body
             continue
@@ -484,8 +558,7 @@ def _tally(race: _Race, out: List[tuple], relay) -> _Round:
             got.retryable = True
             if not got.held:
                 got.held = body
-    """The copy that claimed owns the client, even when its own outcome
-    never came back: a second round would answer one request twice."""
+    # claim holds
     got.committed = race.winner is not None
     return got
 
@@ -507,14 +580,7 @@ def _sticky_verdict(relay, lane) -> None:
 
 def _sticky_sample(relay, lane, t0: float, first_byte_at, first_event_at,
                    model: str = "") -> None:
-    """Donate this attempt's latency to the round -- model calls only.
-
-    Only an answer to a real model call may elect a lane. opencode fetches
-    its models registry (``GET /api.json`` on models.opencode.ai) the moment
-    it starts, and that fast metadata fetch used to win the round before the
-    user typed anything -- so the proof pane announced a lane had "answered"
-    a request nobody made.
-    """
+    """Donate this attempt's latency to the round -- model calls only"""
     sticky = getattr(relay.tor, "sticky", None)
     if sticky is None or not model:
         return
@@ -621,10 +687,19 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
         held = b""
         tried = set()
         bad5xx = 0
+        burnt = False
+        limit_waves = 0
         while True:
-            """Every lane at once: the first answer takes the client."""
+            # RACE_WIDTH
             lanes = _race_lanes(relay, tried)
             if not lanes:
+                # still moving
+                if burnt and limit_waves < _LIMIT_WAVES \
+                        and relay.any_unlimited(set()):
+                    limit_waves += 1
+                    time.sleep(_LIMIT_WAIT_S)
+                    tried.clear()
+                    continue
                 # last body
                 if held:
                     client.sendall(held)
@@ -636,22 +711,30 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
             got = _race_call(client, lanes, host, port, method, path, headers,
                              body, emit, seq, call_n, time.time(), relay,
                              model)
-            for lane, wait in got.limits:
+            for lane, exit_fp, wait, section in got.limits:
                 # burnt here
-                relay.tor.note_limited(lane, wait)
-                relay.report_refused(lane, 429)
+                relay.tor.note_limited(lane, wait, section, fingerprint=exit_fp)
+                relay.report_refused(lane, 429, exit_fp)
                 _sticky_verdict(relay, lane)
             if got.held:
                 # freshest verdict
                 held = got.held
             if got.committed:
-                """The client has its answer; the winner is streaming it."""
+                # committed
                 return
             if got.refused:
-                """opencode is down, not the exit: moving cannot help"""
+                # opencode down
                 client.sendall(held)
                 return
+            if got.limits:
+                burnt = True
             if got.limits and not relay.any_unlimited(tried):
+                # pool burnt
+                if limit_waves < _LIMIT_WAVES and relay.any_unlimited(set()):
+                    limit_waves += 1
+                    time.sleep(_LIMIT_WAIT_S)
+                    tried.clear()
+                    continue
                 # none left
                 if held:
                     client.sendall(held)
@@ -665,7 +748,7 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
                         client.sendall(held)
                     return
             if not got.retryable:
-                """Nothing left to say: the connection is the failure."""
+                # no retry
                 return
             # free retry
             continue
@@ -681,11 +764,7 @@ def _close_quiet(sock) -> None:
 
 def _abort_quiet(sock) -> None:
     """Cut a connection loose, so a read blocked on it lets go at once."""
-    try:
-        sock.shutdown(socket.SHUT_RDWR)
-    except (OSError, AttributeError):
-        pass
-    _close_quiet(sock)
+    netutil.abort_quiet(sock)
 
 
 def _peer_closed(sock) -> bool:
@@ -751,20 +830,26 @@ def _retry_after(rheaders: dict) -> float:
         return 0.0
 
 
-def _limit_of(held: bytes) -> "tuple[bool, float]":
-    """Whether a held 429 is the exit's own limit, and the wait it asks for.
-
-    opencode also answers "Endpoint is unavailable" as a 429. That one is not
-    the exit, so rotating lanes cannot fix it and it is not benched.
-    """
-    if netutil.UPSTREAM_DOWN in held:
-        return False, 0.0
+def _limit_of(held: bytes) -> "tuple[str, float]":
+    """Which section a held 429 belongs in: the free wall, rate, or neither."""
+    # opencode edge
+    if netutil.UPSTREAM_UNAVAILABLE in held:
+        return "", 0.0
     rheaders = {}
     for raw in held.split(b"\r\n\r\n", 1)[0].split(b"\r\n")[1:]:
         if b":" in raw:
             k, v = raw.split(b":", 1)
             rheaders[k.strip().lower()] = v.strip()
-    return True, _retry_after(rheaders)
+    # free wall
+    section = FREE_LIMIT if netutil.QUOTA_SPENT in held else RATE_LIMIT
+    return section, _retry_after(rheaders)
+
+
+def section_of(note: bytes, status: int) -> str:
+    """The notepad section a finished call belongs in, for the pane."""
+    if status != 429:
+        return ""
+    return _limit_of(bytes(note))[0]
 
 
 def _lat(t0: float, first_byte: Optional[float],
@@ -776,25 +861,189 @@ def _lat(t0: float, first_byte: Optional[float],
     }
 
 
+#: lost copy
+_LOST = ("", 0, b"", False)
+
+
+def _build_head(method: str, path: str, headers: dict, body: bytes,
+                keepalive: bool) -> bytes:
+    """The upstream request head, without the hop-by-hop headers."""
+    out = f"{method} {path} HTTP/1.1\r\n".encode("latin1")
+    for k, v in headers.items():
+        if k in _HOP_BY_HOP:
+            continue
+        text = v.decode("latin1") if isinstance(v, bytes) else v
+        out += f"{k}: {text}\r\n".encode("latin1")
+    out += f"content-length: {len(body)}\r\n".encode()
+    return out + (b"connection: keep-alive\r\n\r\n" if keepalive
+                  else b"connection: close\r\n\r\n")
+
+
+def _parse_head(head: bytes) -> "tuple[int, Dict[bytes, bytes]]":
+    """The status code and the headers, out of one upstream head."""
+    try:
+        status = int(head.split(b" ", 2)[1])
+    except (IndexError, ValueError):
+        status = 0
+    headers: Dict[bytes, bytes] = {}
+    for raw in head.split(b"\r\n")[1:]:
+        if raw and b":" in raw:
+            k, v = raw.split(b":", 1)
+            headers[k.strip().lower()] = v.strip()
+    return status, headers
+
+
+def _pump_chunked(uf, read, send, upstream_close: bool) -> "tuple[bool, bool]":
+    """Copy a chunked body verbatim: ``(ended cleanly, tunnel reusable)``."""
+    while True:
+        size_line = read(uf.readline)
+        if not size_line:
+            return False, False
+        try:
+            size = int(size_line.strip().split(b";")[0], 16)
+        except ValueError:
+            send(size_line, body=False)
+            return False, False
+        send(size_line, body=False)
+        if size == 0:
+            # trailer
+            while True:
+                tail = read(uf.readline)
+                if not tail:
+                    break
+                send(tail, body=False)
+                if tail in (b"\r\n", b"\n"):
+                    break
+            return True, not upstream_close
+        chunk = read(_read_exact, uf, size + 2)
+        send(chunk)
+        if len(chunk) < size + 2:
+            return False, False
+
+
+def _pump_length(uf, read, send, remaining: int,
+                 upstream_close: bool) -> "tuple[bool, bool]":
+    """Copy a body of known length: ``(ended cleanly, tunnel reusable)``."""
+    while remaining > 0:
+        chunk = read(uf.read, min(65536, remaining))
+        if not chunk:
+            break
+        send(chunk)
+        remaining -= len(chunk)
+    ended = remaining <= 0
+    return ended, ended and not upstream_close
+
+
+def _pump_eof(uf, read, send) -> "tuple[bool, bool]":
+    """Copy until the far end closes.
+
+    An unframed body has no terminator, so its tunnel is never reusable.
+    """
+    while True:
+        chunk = read(uf.read, 65536)
+        if not chunk:
+            break
+        send(chunk)
+    return True, False
+
+
+def _emit_cut(emit, seq: int, call_n: int, lane: Lane, t0: float, err: str,
+              max_wait: float, client_wait: float, reused: bool,
+              keys: Dict) -> None:
+    """One callend for an attempt that never delivered a body.
+
+    The tail is read by name, so a caller that forgot a key gets a
+    ``KeyError`` here instead of a callend a reader cannot group.
+    """
+    emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
+          "lane": lane.index, "cc": lane.exit_country, "status": 0, "kb": 0,
+          "secs": round(time.time() - t0, 1), "err": err, "cut": True,
+          "note": "",
+          "max_wait_s": round(max_wait, 1),
+          "client_wait_s": round(client_wait, 1),
+          "reused": reused,
+          #: tail keys
+          "first_byte_s": keys["first_byte_s"],
+          "first_event_s": keys["first_event_s"],
+          "exit": keys["exit"],
+          "ip": keys["ip"],
+          "send_s": keys["send_s"],
+          "peer_close": keys["peer_close"],
+          "client_kb": keys["client_kb"],
+          "raced": keys["raced"]})
+
+
+def _dial(lane: Lane, host: str, port: int, pool, copy, charge_timeout: bool,
+          may) -> "tuple":
+    """A tunnel to the far end: a pooled one, else a cold SOCKS5 dial.
+
+    Returns ``(up, uf, kept, err, verdict)``. An ``err`` of ``"-"`` means this
+    copy was beaten to the lane and owes nothing; otherwise the caller reports
+    the error, after charging the lane the ``verdict`` -- ``"timeout"``,
+    ``"ssl"``, or nothing.
+    """
+    kept = pool.take(lane) if pool is not None else None
+    if kept is not None:
+        up, uf = kept
+        if copy is not None and not copy.arm(up):
+            # clean tunnel
+            pool.give(lane, up, uf)
+            return None, None, kept, "-", ""
+        return up, uf, kept, "", ""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # cold lane
+    sock.settimeout(_FIRST_BYTE_TIMEOUT)
+    try:
+        sock.connect(("127.0.0.1", lane.socks_port))
+        err = netutil.socks5_open(
+            sock, host, port,
+            cred=netutil.lane_cred(lane.index))
+        if err:
+            # lane dead
+            _close_quiet(sock)
+            if copy is not None and copy.beaten:
+                # our cut
+                return None, None, kept, "-", ""
+            verdict = ("timeout" if err == "timed out" and charge_timeout
+                       and may() else "")
+            return None, None, kept, err, verdict
+        up = ssl.create_default_context().wrap_socket(
+            sock, server_hostname=host)
+        if copy is not None and not copy.arm(up):
+            # beaten dial
+            _close_quiet(up)
+            return None, None, kept, "-", ""
+        return up, None, kept, "", ""
+    except (ssl.SSLError, OSError) as exc:
+        sock.close()
+        if copy is not None and copy.beaten:
+            # our cut
+            return None, None, kept, "-", ""
+        if type(exc).__name__ == "ConnectionRefusedError":
+            # lane down
+            lane.healthy = False
+        verdict = ("ssl" if charge_timeout and isinstance(exc, ssl.SSLError)
+                   and may() else "")
+        return None, None, kept, f"{type(exc).__name__}", verdict
+
+
 def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                method: str, path: str, headers: dict, body: bytes,
                emit, seq: int, call_n: int, t0: float, relay: "object",
                charge_timeout: bool = False,
                model: Optional[str] = None, copy: Optional[_Copy] = None
                ) -> "tuple[str, int, bytes, bool]":
-    """One upstream attempt; 429s buffer into ``held`` for a lane retry.
-
-    With a ``copy``, this is one lane's go in a race: it claims the client
-    at its first content byte, and loses silently to a faster lane.
-    """
+    """One upstream attempt; 429s buffer into ``held`` for a lane retry."""
+    # race copy
     if copy is not None and copy.beaten:
-        """A lane that answered first has the client: nothing to dial for."""
-        return "", 0, b"", False
+        # claimed first
+        return _LOST
     if model is None:
         # model calls
         model = _model_of(body) if body else ""
     first_byte_at = None   # byte one
     first_event_at = None  # event one
+    content_by = t0 + _FIRST_CONTENT_TIMEOUT  # first content
     # above dial
     max_wait = 0.0         # longest wait
     client_wait = 0.0      # longest client
@@ -810,88 +1059,37 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
         return copy is None or copy.stands()
 
     def _witness() -> bool:
-        """True when this copy's lane carries this call's dead-exit verdict.
-
-        The first copy speaks for a pool-wide failure, so one dead pool
-        cannot retire six exits; the copy that won and then lost its own
-        stream is the only voice left for that exit.
-        """
+        """True when this copy's lane carries this call's dead-exit verdict"""
         return charge_timeout or (copy is not None and copy.owns())
 
     def _keys() -> Dict:
         """The keys every callend carries, in one place."""
+        rode = copy if copy is not None else None
         return {**_lat(t0, first_byte_at, first_event_at),
+                "exit": (rode.exit_fp if rode is not None
+                         else lane.exit_fingerprint),
+                "ip": rode.exit_ip if rode is not None else lane.exit_ip,
                 "send_s": round(send_wait, 1),
                 "peer_close": peer_close,
                 "client_kb": round(sent / 1024, 1),
                 "raced": copy.race.raced() if copy is not None
                 and copy.race is not None else 0}
 
-    kept = pool.take(lane) if pool is not None else None
-    uf = None
-    if kept is not None:
-        up, uf = kept
-        if copy is not None and not copy.arm(up):
-            """Beaten before the first byte, so the tunnel is still clean."""
-            pool.give(lane, up, uf)
-            return "", 0, b"", False
-    else:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # cold lane
-        sock.settimeout(_FIRST_BYTE_TIMEOUT)
-        try:
-            sock.connect(("127.0.0.1", lane.socks_port))
-            err = netutil.socks5_open(
-                sock, host, port,
-                cred=netutil.lane_cred(lane.index))
-            if err:
-                # lane dead
-                _close_quiet(sock)
-                if copy is not None and copy.beaten:
-                    """Our own cut: not a failure, and not this lane's."""
-                    return "", 0, b"", False
-                if err == "timed out" and charge_timeout and _may():
-                    # dead exit
-                    _note_timeout(relay, lane, emit, seq, call_n)
-                emit({"type": "callend", "t": time.time(), "n": seq,
-                      "c": call_n, "lane": lane.index,
-                      "cc": lane.exit_country, "status": 0, "kb": 0,
-                      "secs": round(time.time() - t0, 1), "err": err,
-                      "cut": True,
-                      "note": "",
-                      "max_wait_s": round(max_wait, 1),
-                      "client_wait_s": round(client_wait, 1),
-                      "reused": kept is not None,
-                      **_keys()})
-                return err, 0, b"", True
-            up = ssl.create_default_context().wrap_socket(
-                sock, server_hostname=host)
-            if copy is not None and not copy.arm(up):
-                """Beaten while dialling: this copy never says a word."""
-                _close_quiet(up)
-                return "", 0, b"", False
-        except (ssl.SSLError, OSError) as exc:
-            sock.close()
-            if copy is not None and copy.beaten:
-                """Our own cut: not a failure, and not this lane's."""
-                return "", 0, b"", False
-            err = f"{type(exc).__name__}"
-            if err == "ConnectionRefusedError":
-                # lane down
-                lane.healthy = False
-            if charge_timeout and isinstance(exc, ssl.SSLError) and _may():
-                # dead exit
-                _note_ssl(relay, lane, emit, seq, call_n)
-            emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
-                  "lane": lane.index, "cc": lane.exit_country, "status": 0,
-                  "kb": 0, "secs": round(time.time() - t0, 1), "err": err,
-                  "cut": True,
-                  "note": "",
-                  "max_wait_s": round(max_wait, 1),
-                  "client_wait_s": round(client_wait, 1),
-                  "reused": kept is not None,
-                  **_keys()})
-            return err, 0, b"", True
+    up, uf, kept, err, verdict = _dial(lane, host, port, pool, copy,
+                                       charge_timeout, _may)
+    if err == "-":
+        # our cut
+        return _LOST
+    if err:
+        if verdict == "timeout":
+            # dead exit
+            _note_timeout(relay, lane, emit, seq, call_n)
+        elif verdict == "ssl":
+            # dead exit
+            _note_ssl(relay, lane, emit, seq, call_n)
+        _emit_cut(emit, seq, call_n, lane, t0, err, max_wait, client_wait,
+                  kept is not None, _keys())
+        return err, 0, b"", True
 
     total = 0
     held = bytearray()
@@ -905,6 +1103,13 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
     _open = bytearray()     # pre-commit bytes
     _cap = bytearray()      # cut capture
     _committed = False      # client content
+    progress = {"bytes": 0, "at": time.time()}  #: last heard
+    # last byte
+    heard = {"at": time.time()}
+    lane.track_stream(up, progress,             # hang up
+                      hangup=lambda: netutil.abort_quiet(client))
+    beat_stop = threading.Event()
+    beat: Optional[threading.Thread] = None
 
     def _stamp_byte() -> None:
         nonlocal first_byte_at
@@ -932,18 +1137,44 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
             client.sendall(data)
             # after success
             sent += len(data)
+            progress["bytes"] = sent
+            progress["at"] = time.time()
         finally:
             # even raising
             waited = time.monotonic() - t
             if waited > client_wait:
                 client_wait = waited
 
+    def _beat() -> None:
+        """Say this copy is still out there, and how long it has heard nothing."""
+        # parked stream
+        while not beat_stop.wait(_PULSE_S):
+            emit({"type": "flow", "t": time.time(), "n": seq, "c": call_n,
+                  "lane": lane.index, "cc": lane.exit_country,
+                  "ip": lane.exit_ip,
+                  "kb": round(progress["bytes"] / 1024, 1),
+                  "waited_s": round(time.time() - progress["at"], 1)})
+
+    def _ceiling_left() -> float:
+        """The read ceiling for this stream, whichever phase it is in."""
+        # phase ceiling
+        if not _committed:
+            return max(0.05, min(_READ_TIMEOUT, content_by - time.time()))
+        return max(0.05,
+                   min(_STREAM_IDLE_TIMEOUT,
+                       heard["at"] + _STALL_CUT_S - time.time()))
+
+    def _read(fn, *args):
+        """One upstream read, under whichever ceiling applies right now."""
+        up.settimeout(_ceiling_left())
+        return _timed(fn, *args)
+
     def _flush() -> None:
         # commit both
         nonlocal _committed
         if not _committed:
             if copy is not None and not copy.claim():
-                """A lane that answered first already has the client."""
+                # beaten claim
                 raise _Beaten
             _committed = True
             _to_client(bytes(_open))
@@ -954,6 +1185,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
     def _send(data: bytes, body: bool = True) -> None:
         nonlocal total, _tail, first_event_at
         total += len(data)
+        heard["at"] = time.time()  # heard
         if _CAPTURE and len(_cap) < _CAPTURE_MAX:
             _cap.extend(data)
         if held is not None:
@@ -981,21 +1213,12 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
 
     try:
         # rebuild head
-        out_head = f"{method} {path} HTTP/1.1\r\n".encode("latin1")
-        # we answer
-        skip = {"connection", "keep-alive", "proxy-authenticate",
-                "proxy-authorization", "te", "trailer", "transfer-encoding",
-                "upgrade", "content-length", "expect"}
-        for k, v in headers.items():
-            if k in skip:
-                continue
-            vv = v.decode("latin1") if isinstance(v, bytes) else v
-            out_head += f"{k}: {vv}\r\n".encode("latin1")
-        out_head += f"content-length: {len(body)}\r\n".encode()
-        out_head += (b"connection: keep-alive\r\n\r\n" if pool is not None
-                     else b"connection: close\r\n\r\n")
+        out_head = _build_head(method, path, headers, body, pool is not None)
         # send window
         up.settimeout(_SEND_TIMEOUT)
+        beat = threading.Thread(target=_beat, name=f"beat-{seq}-{lane.index}",
+                                daemon=True)
+        beat.start()
         _push = time.monotonic()
         try:
             _timed(up.sendall, out_head + body)
@@ -1006,31 +1229,18 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
         if uf is None:
             uf = up.makefile("rb")
         # head window
-        up.settimeout(_READ_TIMEOUT)
+        head_window = _ceiling_left()
+        up.settimeout(head_window)
         # head counts
         rhead = _timed(_read_head, uf, _stamp_byte, sock=up,
-                       ceiling=_READ_TIMEOUT)
+                       ceiling=head_window)
+        if rhead:
+            heard["at"] = time.time()  # heard
         if rhead is None:
-            err = "upstream closed"
-            emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
-                  "lane": lane.index, "cc": lane.exit_country, "status": 0,
-                  "kb": 0, "secs": round(time.time() - t0, 1), "err": err,
-                  "cut": True,
-                  "note": "",
-                  "max_wait_s": round(max_wait, 1),
-                  "client_wait_s": round(client_wait, 1),
-                  "reused": kept is not None,
-                  **_keys()})
-            return err, 0, b"", True
-        try:
-            status = int(rhead.split(b" ", 2)[1])
-        except (IndexError, ValueError):
-            pass
-        rheaders = {}
-        for raw in rhead.split(b"\r\n")[1:]:
-            if raw and b":" in raw:
-                k, v = raw.split(b":", 1)
-                rheaders[k.strip().lower()] = v.strip()
+            _emit_cut(emit, seq, call_n, lane, t0, "upstream closed",
+                      max_wait, client_wait, kept is not None, _keys())
+            return "upstream closed", 0, b"", True
+        status, rheaders = _parse_head(rhead)
 
         if status == 429:
             retry_after = _retry_after(rheaders)
@@ -1056,65 +1266,23 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
 
         if b"chunked" in rheaders.get(b"transfer-encoding", b""):
             # verbatim
-            while True:
-                size_line = _timed(uf.readline)
-                if not size_line:
-                    break
-                try:
-                    size = int(size_line.strip().split(b";")[0], 16)
-                except ValueError:
-                    _send(size_line, body=False)
-                    break
-                _send(size_line, body=False)
-                if size == 0:
-                    # trailer
-                    while True:
-                        tl = _timed(uf.readline)
-                        if not tl:
-                            break
-                        _send(tl, body=False)
-                        if tl in (b"\r\n", b"\n"):
-                            break
-                    clean_end = True
-                    keep = not upstream_close
-                    break
-                chunk = _timed(_read_exact, uf, size + 2)
-                _send(chunk)
-                if len(chunk) < size + 2:
-                    break  # died mid-chunk
+            clean_end, keep = _pump_chunked(uf, _read, _send, upstream_close)
         elif b"content-length" in rheaders:
-            remaining = int(rheaders[b"content-length"])
-            while remaining > 0:
-                chunk = _timed(uf.read, min(65536, remaining))
-                if not chunk:
-                    break
-                _send(chunk)
-                remaining -= len(chunk)
-            clean_end = remaining <= 0
-            keep = clean_end and not upstream_close
+            clean_end, keep = _pump_length(
+                uf, _read, _send, int(rheaders[b"content-length"]),
+                upstream_close)
         else:
-            while True:
-                chunk = _timed(uf.read, 65536)
-                if not chunk:
-                    break
-                _send(chunk)
-            clean_end = True  # eof ends
+            clean_end, keep = _pump_eof(uf, _read, _send)
 
         # empty body
         if not _committed and held is None:
-            emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
-                  "lane": lane.index, "cc": lane.exit_country, "status": 0,
-                  "kb": 0, "secs": round(time.time() - t0, 1),
-                  "err": "no body", "cut": True,
-                  "note": "",
-                  "max_wait_s": round(max_wait, 1),
-                  "client_wait_s": round(client_wait, 1),
-                  "reused": kept is not None,
-                  **_keys()})
+            _emit_cut(emit, seq, call_n, lane, t0, "no body",
+                      max_wait, client_wait, kept is not None, _keys())
             return "no body", 0, b"", True
 
         if keep and held is None and pool is not None:
             # reuse tunnel
+            lane.drop_stream(up)
             pool.give(lane, up, uf)
             up = None
 
@@ -1139,14 +1307,15 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
               "cut": not clean_end,
               "reused": kept is not None,
               "retry_after": round(retry_after),
+              "limit": section_of(note_buf, status),
               "note": _note_of(bytes(note_buf)),
               "max_wait_s": round(max_wait, 1),
               "client_wait_s": round(client_wait, 1),
               **_keys()})
         return "", status, bytes(held or b""), False
     except _Beaten:
-        """A copy that lost: the winner has the client, so say nothing."""
-        return "", 0, b"", False
+        # lost copy
+        return _LOST
     # bad length
     except (ssl.SSLError, OSError, ValueError) as exc:
         err = f"{type(exc).__name__}"
@@ -1181,5 +1350,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
               **_keys()})
         return err, 0, b"", retryable
     finally:
+        beat_stop.set()
         if up is not None:
+            lane.drop_stream(up)
             _close_quiet(up)

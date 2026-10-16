@@ -1,4 +1,4 @@
-"""``lingling --demo`` -- cook the lanes and show the receipts: which lane, which exit IP, and what ..."""
+"""``lingling --demo``: cook the lanes and show the receipts."""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ def _demo_body(manager: TorManager, question: str) -> int:
             if lane.healthy is not True:
                 code = daemon.reachable(lane)
                 if code == 429:
-                    daemon.on_refused(lane, code)
+                    daemon.refuse(lane, code)
                     continue
                 lane.healthy = bool(code)
                 if code:
@@ -111,8 +111,14 @@ def _demo_body(manager: TorManager, question: str) -> int:
     dt = time.time() - t0
 
     if code == 429:
-        _say(" !! 429 from upstream -- the lane would now be re-cooked "
-             "(that's the rotation working)")
+        # which wall
+        if netutil.UPSTREAM_UNAVAILABLE in body:
+            section = "opencode edge unfair"
+        else:
+            section = ("free limit" if netutil.QUOTA_SPENT in body
+                       else "rate limit")
+        _say(f" !! 429 {section} from upstream -- the lane would now be "
+             "re-cooked (that's the rotation working)")
         manager.stop_all()
         return 1
     if code == 403:
