@@ -15,26 +15,19 @@ import urllib.request
 from pathlib import Path
 from typing import Optional, Sequence
 
-# manifest url
 MANIFEST_URL = "https://lingling-update.vercel.app/api/latest"
 
-# fallback
 PYPI_URL = "https://pypi.org/pypi/lingling/json"
 
-# format
 SCHEMA = 1
 
-# cache ttl
 CACHE_TTL = 6 * 3600
 FAIL_TTL = 3600
 
-# request bound
 TIMEOUT = 3.0
 
-# check bound
 BUDGET = 8.0
 
-# helper wait
 HELPER_WAIT = 24 * 3600
 
 CACHE_NAME = "update-check.json"
@@ -78,7 +71,6 @@ Nothing here is required: with the check off, lingling launches exactly
 as it did before this command existed.
 """
 
-# no os.kill
 _HELPER = r'''
 import os, subprocess, sys, time
 
@@ -162,9 +154,6 @@ sys.exit(rc)
 '''
 
 
-# ---------------------------------------------------------------------------
-# versions
-# ---------------------------------------------------------------------------
 
 def _version_text(value) -> Optional[str]:
     """Accept only the release scheme the updater can compare safely."""
@@ -218,9 +207,6 @@ def current_version() -> str:
     return __version__
 
 
-# ---------------------------------------------------------------------------
-# the knobs
-# ---------------------------------------------------------------------------
 
 def mode() -> str:
     """``auto`` (default), ``notify``, or ``off`` -- read per call"""
@@ -247,9 +233,6 @@ def _override_cmd() -> list:
     return [p.strip('"') for p in parts if p.strip('"')]
 
 
-# ---------------------------------------------------------------------------
-# the check
-# ---------------------------------------------------------------------------
 
 def _get_json(url: str, timeout: float):
     """A JSON GET, or None. Never raises -- a check is not a feature."""
@@ -278,7 +261,6 @@ def _lookup(timeout: float) -> dict:
             info["source"] = "manifest"
             if info["latest"]:
                 return info
-    # registry stays
     doc = _get_json(PYPI_URL, timeout)
     if isinstance(doc, dict):
         registry = doc.get("info")
@@ -299,7 +281,6 @@ def read_cache(data_dir) -> Optional[dict]:
     try:
         doc = json.loads(_cache_path(data_dir).read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
-        # bad cache
         return None
     return _safe_info(doc) if isinstance(doc, dict) else None
 
@@ -386,8 +367,6 @@ def notice_lines(info: Optional[dict], current: Optional[str] = None,
     return lines
 
 
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 
 class Check:
     """A background check, and the answer when it arrives"""
@@ -401,7 +380,6 @@ class Check:
         def run() -> None:
             deadline = time.time() + BUDGET
             try:
-                # old launcher
                 sweep_launcher_leftovers()
                 cached = read_cache(data_dir)
                 if fresh(cached):
@@ -459,9 +437,6 @@ def cached_hint(data_dir, stream=None) -> None:
         _say(stream, line)
 
 
-# ---------------------------------------------------------------------------
-# the install
-# ---------------------------------------------------------------------------
 
 def install_method() -> str:
     """How this copy was installed: ``pipx``, ``uv``, or ``pip``"""
@@ -564,13 +539,11 @@ def run_install(capture: bool = False, timeout: float = 600):
 
     if parked is not None:
         if launcher.exists():
-            # dead weight
             try:
                 parked.unlink()
             except OSError:
                 pass
         else:
-            # restore
             try:
                 os.replace(parked, launcher)
             except OSError:
@@ -602,9 +575,6 @@ def helper_python() -> str:
     return sys.executable or "python"
 
 
-# installer flags
-#:
-# no console
 _DETACHED = 0x00000008
 _NEW_GROUP = 0x00000200
 _BREAKAWAY = 0x01000000
@@ -642,7 +612,6 @@ def spawn_deferred(data_dir, delay: Optional[float] = None):
                 **_detach_kwargs(breakaway))
             break
         except Exception:  # noqa: BLE001
-            # no breakaway
             proc = None
     if proc is None:
         try:
@@ -660,18 +629,13 @@ def spawn_deferred(data_dir, delay: Optional[float] = None):
     return proc.pid
 
 
-# ---------------------------------------------------------------------------
-# the question
-# ---------------------------------------------------------------------------
 
-# handoff ask
 PROMPT = "  install it when this session ends? [Y/n] "
 
 SKIP_LINE = ("  ok -- skipped: `lingling update` installs it when you want, "
              "and LINGLING_UPDATE=notify stops the question")
 
 
-# no shapes
 _NO = ("n", "no")
 
 
@@ -683,7 +647,6 @@ def _console_stdin() -> bool:
         return bool(kernel32.GetConsoleMode(
             kernel32.GetStdHandle(-10), ctypes.byref(ctypes.c_uint())))
     except Exception:  # noqa: BLE001
-        # no ctypes
         return False
 
 
@@ -697,7 +660,6 @@ def _at_terminal(stdout=None) -> bool:
             return _console_stdin()
         return bool(sys.stdin.isatty())
     except Exception:  # noqa: BLE001
-        # no isatty
         return False
 
 
@@ -710,7 +672,6 @@ def _pending_input() -> bool:
         import select
         return bool(select.select([sys.stdin], [], [], 0)[0])
     except Exception:  # noqa: BLE001
-        # no console
         return True
 
 
@@ -727,7 +688,6 @@ def _ask(prompt: str, stream) -> str:
         stream.write(prompt)
         stream.flush()
     except Exception:  # noqa: BLE001
-        # no ask
         return "n"
     try:
         return input()
@@ -750,9 +710,6 @@ def auto_install(data_dir, info: Optional[dict], ask: bool = False,
     return spawn_deferred(data_dir)
 
 
-# ---------------------------------------------------------------------------
-# explicit cmd
-# ---------------------------------------------------------------------------
 
 def _report(current: str, info: dict, stream=None) -> None:
     stream = stream or sys.stdout
@@ -776,7 +733,6 @@ def update_command(rest: Sequence[str]) -> int:
     if "--help" in args or "-h" in args:
         print(UPDATE_HELP)
         return 0
-    # first run
     sweep_launcher_leftovers()
     check_only = "--check" in args
     now = "--now" in args
@@ -788,7 +744,6 @@ def update_command(rest: Sequence[str]) -> int:
     _report(current, info)
 
     if not info.get("latest"):
-        # silence
         print("  could not reach the update servers -- nothing was changed.")
         print("  install by hand:  " + " ".join(upgrade_command()))
         return 1

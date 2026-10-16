@@ -6,7 +6,6 @@ import pathlib
 import random
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
-#: worldwide exits
 WORLD_CC = frozenset([
     "us", "de", "nl", "fr", "se", "ch", "at", "ca", "gb", "ro",
     "fi", "pl", "cz", "hu", "bg", "lt", "lv", "ee", "dk", "no",
@@ -91,7 +90,6 @@ def load_relays(path: pathlib.Path,
             by_country.setdefault(cc, []).append(
                 Exit(desc.fingerprint, desc.address, desc.nickname,
                      int(desc.bandwidth or 0)))
-    #: best first
     for exits in by_country.values():
         exits.sort(key=lambda e: -e.bandwidth)
     return by_country
@@ -134,7 +132,6 @@ def claim(by_country: Dict[str, List[Exit]], country: str,
     pool = _open(by_country.get(country.upper(), ()), avoid, limited, now)
     if not pool:
         return None
-    #: verified lead
     pool.sort(key=lambda e: (0 if fresh.get(e.fingerprint, 0.0) > now else 1,
                              used.get(e.fingerprint, 0.0), -e.bandwidth))
     return pool[0]
@@ -146,9 +143,8 @@ def sweep_order(by_country: Dict[str, List[Exit]], country: str,
                 now: float) -> List[Exit]:
     """Relays in ``country`` worth rotating onto, a verified one first."""
     pool = _open(by_country.get(country.upper(), ()), avoid, limited, now)
-    #: verified first
     return sorted(pool,
                   key=lambda e: (0 if verified.get(e.fingerprint, 0.0) > now
                                   else 1,
                                   used.get(e.fingerprint, 0.0),
-                                  random.random()))  # spread tiebreak
+                                  random.random()))

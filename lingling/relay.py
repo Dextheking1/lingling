@@ -13,12 +13,9 @@ from typing import Callable, Dict, List, Optional
 from . import bounds, netutil
 from .lanes import Lane, TorManager
 
-#: connection cap
 _MAX_CONNS = bounds.count("LINGLING_MAX_CONNS", 256, 1, 4096)
 
-#: losing country
 _LOSING = bounds.count("LINGLING_LOSING_SCORE", -2, -1000, 1000)
-#: thin pool
 _LOSING_MIN_POOL = bounds.count("LINGLING_LOSING_MIN_POOL", 4, 0, 256)
 
 
@@ -33,10 +30,9 @@ class Relay:
     ) -> None:
         self.tor = tor
         self.host = host
-        self.port = port  #: auto port
+        self.port = port
         self._emit = event or (lambda e: None)
         self.dial_timeout = dial_timeout
-        #: never 502
         self.wait_budget = bounds.number("LINGLING_LANE_WAIT", 90,
                                         0.0, bounds.WINDOW_S)
         self._server: Optional[asyncio.AbstractServer] = None
@@ -44,13 +40,9 @@ class Relay:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._ready = threading.Event()
         self._seq = itertools.count(1)
-        #: cert shop
-        self.cert_shop = None  # lingling.mitm.CertShop
-        #: idle tunnels
-        self.tunnels = None  # lingling.mitm.TunnelPool
-        #: connection slots
+        self.cert_shop = None
+        self.tunnels = None
         self._slots = threading.BoundedSemaphore(_MAX_CONNS)
-        #: live count
         self._live = 0
         self._live_lock = threading.Lock()
 
@@ -67,7 +59,6 @@ class Relay:
             self._live -= 1
         self._slots.release()
 
-    # lifecycle
     def start(self) -> int:
         """Serve on a background thread. Returns the bound port."""
         self._thread = threading.Thread(
@@ -78,7 +69,6 @@ class Relay:
         return self.port
 
     def _run(self) -> None:
-        # selector loop
         if os.name == "nt":
             asyncio.set_event_loop_policy(
                 asyncio.WindowsSelectorEventLoopPolicy())
@@ -104,11 +94,9 @@ class Relay:
     def _shutdown(self) -> None:
         if self._server:
             self._server.close()
-        # cancel tunnels
         for task in asyncio.all_tasks(self._loop):
             if task is not asyncio.current_task(self._loop):
                 task.cancel()
-        # stop soon
         self._loop.call_later(0.2, self._loop.stop)
 
     @staticmethod
@@ -129,7 +117,6 @@ class Relay:
             return
         loop.default_exception_handler(context)
 
-    # mitm
     def _should_mitm(self, host: str) -> bool:
         if self.cert_shop is None:
             return False
@@ -141,7 +128,6 @@ class Relay:
                            reader: asyncio.StreamReader,
                            writer: asyncio.StreamWriter) -> None:
         """200, dup socket, hand it to a MITM thread."""
-        # bounded
         if not self._slot_enter():
             self._emit({
                 "type": "lane", "kind": "fail", "t": time.time(),
@@ -164,7 +150,6 @@ class Relay:
                 self._slot_exit()
                 writer.close()
                 return
-            # pause reads
             transport = writer.transport
             try:
                 transport.pause_reading()
@@ -191,7 +176,6 @@ class Relay:
         threading.Thread(target=_serve_conn, name=f"mitm-{seq}",
                          daemon=True).start()
 
-    # lane picking
     def any_unlimited(self, exclude: set) -> bool:
         """True when some lane we have not tried can still serve."""
         now = time.time()
@@ -207,23 +191,18 @@ class Relay:
         if not candidates:
             return None
 
-        # thin pool
         strict = len(candidates) >= _LOSING_MIN_POOL
         now = time.time()
 
         def key(l: Lane):
-            # server said
             limited = 1 if l.limited_until > now else 0
-            # cold circuit
             cold = 0 if l.asked else 1
-            # last resort
             losing = (1 if self.tor.score_of(l.exit_country) <= _LOSING
                       else 0) if strict else 0
             return (limited, cold, l.active, losing, l.last_used_at)
 
         lane = min(candidates, key=key)
         lane.last_used_at = time.perf_counter_ns()
-        # real request
         lane.last_real_at = time.time()
         return lane
 
@@ -235,14 +214,11 @@ class Relay:
         the one the lane rides by now: the hook needs it to write off the right
         relay and to leave a lane that has already moved alone.
         """
-        # score it
         self.tor.note_result(lane.exit_country, status)
         if self.tor.limit_hook is not None:
             try:
                 self.tor.limit_hook(lane, status, fingerprint)
             except Exception as exc:  # noqa: BLE001
-                # hook guard
-                # been made
                 self._emit({
                     "type": "lane", "kind": "fail", "t": time.time(),
                     "lane": lane.index, "cc": lane.exit_country,
@@ -251,7 +227,6 @@ class Relay:
                            f"moving it failed: {exc}",
                 })
             return
-        # no daemon
         lane.healthy = False
         self._emit({
             "type": "lane", "kind": "limited", "t": time.time(),
@@ -259,7 +234,6 @@ class Relay:
             "msg": f"lane {lane.index} was refused ({status}) -- re-cooking it",
         })
 
-    # connection handling
     async def _handle(self, reader: asyncio.StreamReader,
                       writer: asyncio.StreamWriter) -> None:
         seq = next(self._seq)
@@ -274,7 +248,6 @@ class Relay:
             writer.close()
             return
         if method.upper() != "CONNECT":
-            # connect only
             try:
                 while True:
                     h = await asyncio.wait_for(reader.readline(), timeout=5)
@@ -336,7 +309,6 @@ class Relay:
                     lane = None
             if lane is not None:
                 break
-            # never 502
             if time.time() >= deadline:
                 break
             if not held:
@@ -400,7 +372,6 @@ class Relay:
                 if resp[0] != 0x05 or resp[1] != 0x00:
                     raise ConnectionError("bad SOCKS5 greeting")
             else:
-                # both methods
                 writer.write(bytes([0x05, 0x02, 0x00, 0x02]))
                 await writer.drain()
                 resp = await reader.readexactly(2)

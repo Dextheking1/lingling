@@ -14,14 +14,10 @@ from .lanes import Lane, TorManager
 
 UPSTREAM_HOST = "opencode.ai"
 UPSTREAM_PROBE_PATH = "/zen/v1/models"
-#: responses path
 UPSTREAM_MODEL_PATH = "/zen/v1/responses"
-#: chat path
 UPSTREAM_CHAT_PATH = "/zen/v1/chat/completions"
-#: probe model
 PROBE_MODEL = os.environ.get("LINGLING_PROBE_MODEL",
                              "muse-spark-1.3-contributor-free")
-#: probe path
 PROBE_PATH = os.environ.get("LINGLING_PROBE_PATH", UPSTREAM_MODEL_PATH)
 
 
@@ -35,15 +31,12 @@ def _scan_body(model: str, path: str = UPSTREAM_MODEL_PATH) -> bytes:
             b'"max_output_tokens":1,'
             b'"input":[{"role":"user","content":'
             b'[{"type":"input_text","text":"x"}]}]}')
-# required UA
 UPSTREAM_UA = os.environ.get("LINGLING_UPSTREAM_USER_AGENT", "opencode/1.0")
 
 PROBE_TIMEOUT = 15.0
 
-#: sweep interval
 SWEEP_S = bounds.number("LINGLING_SWEEP_S", 20, 0.0, bounds.WINDOW_S)
 
-#: probe verdicts
 PROBE_VERDICTS = (200, 403, 429)
 
 
@@ -67,12 +60,10 @@ class HealthDaemon:
     ) -> None:
         self.tor = tor
         self.check_interval = check_interval
-        # event sink
         self._emit = event or (lambda e: None)
         self.log = log or (lambda *a, **k: None)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        # refusal hook
         tor.limit_hook = self.on_refused
 
     def start(self) -> None:
@@ -117,7 +108,6 @@ class HealthDaemon:
             lane.probe_note = type(exc).__name__
             return 0
         if code == 429:
-            # which section
             if netutil.UPSTREAM_UNAVAILABLE in body:
                 lane.probe_note = "opencode down"
                 return 0
@@ -138,18 +128,14 @@ class HealthDaemon:
     def check_once(self) -> None:
         """Bring up any lane that is down, and check a new lane's exit."""
         for lane in self.tor.lanes:
-            # not ours
             if not lane.wanted:
                 continue
-            # mid-launch
             if lane.healing:
                 continue
-            # down
             if (lane.process is None or lane.process.poll() is not None
                     or not lane.healthy):
                 self._revive(lane)
                 continue
-            # dead port
             if not netutil.port_is_open("127.0.0.1", lane.socks_port,
                                         timeout=netutil.PORT_CHECK_TIMEOUT):
                 lane.probe_code = -1
@@ -159,7 +145,6 @@ class HealthDaemon:
                 continue
             code = self.reachable(lane)
             if code == 429:
-                #: burnt
                 self.tor.note_result(lane.exit_country, code)
                 self.refuse(lane, code)
                 continue
@@ -171,7 +156,6 @@ class HealthDaemon:
                     f"lane {lane.index} {{{lane.exit_country}}} is up "
                     f"-- exit {lane.exit_ip or '?'}")
                 continue
-            # no verdict
             if lane.probe_code != code:
                 lane.probe_code = code
                 note = getattr(lane, "probe_note", "")
@@ -190,7 +174,6 @@ class HealthDaemon:
         sweep -- where ``reachable`` has already read the reason off the reply.
         """
         if status != 429:
-            # no signal
             return
         self.tor.note_limited(lane, reason=lane.probe_reason or RATE_LIMIT)
         self.on_refused(lane, status)
@@ -207,13 +190,10 @@ class HealthDaemon:
         left the refused exit is left where it is.
         """
         if status != 429:
-            # no signal
             return
         exit_fp = fingerprint or lane.exit_fingerprint
         if exit_fp and exit_fp != lane.exit_fingerprint:
-            # left already
             return
-        #: one move
         if not self.tor.claim_move(lane):
             return
         moved = self.tor.rotate_exit_country(lane)
@@ -296,23 +276,23 @@ class ExitSweep:
         benched = [l for l in idle if l.limited_until > now]
         for lane in benched + [l for l in idle if l.limited_until <= now]:
             if self._reaim(lane, lane.limited_until > now):
-                return             # one move
+                return
 
     def _reaim(self, lane: Lane, sitting_out: bool = False) -> bool:
         """Move one lane to another exit in its own country, if it has one."""
         candidates = self.tor.sweep_candidates(lane.exit_country)
         if not candidates:
-            return False           # empty pool
+            return False
         target = candidates[0]
         if target.fingerprint == lane.exit_fingerprint:
-            return False           # already best
+            return False
         lane.healing = True
         try:
             moved = self.tor.move_exit(lane, target)
         finally:
             lane.healing = False
         if not moved:
-            return False           # move refused
+            return False
         said = (f"lane {lane.index} {{{lane.exit_country}}} was sitting out a "
                 f"spent exit -- back on {target.ip}" if sitting_out
                 else f"lane {lane.index} {{{lane.exit_country}}} spread to "

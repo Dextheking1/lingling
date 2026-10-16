@@ -15,10 +15,8 @@ from .bench import FREE_LIMIT, RATE_LIMIT, bench_span
 
 DONE = {"type": "done"}
 
-#: refusal note
 QUOTA_NOTE = netutil.QUOTA_SPENT.decode("ascii")
 UPSTREAM_NOTE = netutil.UPSTREAM_UNAVAILABLE.decode("ascii")
-#: parked threshold
 _PARKED_S = 20.0
 
 _LOCK = threading.Lock()
@@ -63,7 +61,6 @@ def _section(ev: Dict) -> str:
     if section:
         return str(section)
     note = ev.get("note") or ""
-    # older event
     if QUOTA_NOTE in note:
         return FREE_LIMIT
     if UPSTREAM_NOTE in note:
@@ -131,31 +128,25 @@ def _render(ev: Dict) -> str:
         status = ev.get("status", 0)
         err = ev.get("err") or ""
         served = bool(status) and (ev.get("kb") or 0) > 0
-        # far-end hangup
         hung_up = (served and 200 <= status < 300
                    and ev.get("stalled") == "client")
         if err:
             if hung_up:
-                # peer gone
                 verdict = _c(str(status), "32") + _c("  client hung up", "90")
             elif served:
-                # served, cut
                 verdict = _c(f"{status} cut ({err})", "31")
             else:
                 verdict = _c(f"failed ({err})", "31")
             if ev.get("stalled") and not hung_up:
                 verdict += _c(f" [{ev['stalled']} stalled]", "90")
         elif status == 429 and _section(ev) == FREE_LIMIT:
-            # daily wall
             verdict = _c("429", "33") + _c(
                 f" free limit -- exit out until {_reset(ev)} -- moving it",
                 "90")
         elif status == 429 and _section(ev) == RATE_LIMIT:
-            # burst limit
             verdict = _c("429", "33") + _c(
                 f" rate limit -- exit out {_wait(ev)} -- moving it", "90")
         elif status == 429:
-            # opencode edge
             verdict = _c(
                 "429 OPENCODE EDGE UNAVAILABLE -- not this exit", "1;33")
         else:
@@ -167,17 +158,14 @@ def _render(ev: Dict) -> str:
                 verdict += _c(f"  {ev['note'][:80]}", "90")
         who = ""
         if (ev.get("raced") or 0) > 1:
-            # winning lane
             who = _c(f"lane {ev.get('lane', 0)} {{{ev.get('cc') or '??'}}}",
                      "32") + " "
         return (f"{_c(ts, '90')}    {_c('|', '90')} "
                 f"{_c(f'#{n}.{c}', '90')} {who}{verdict} "
                 f"{_c(_lat_bits(ev), '90')}")
     if ev.get("type") == "flow":
-        # dim heartbeat.
         n = ev.get("n", 0)
         kb = ev.get("kb", 0)
-        # silent wait
         waited = ev.get("waited_s") or 0
         gap = f" -- no bytes for {waited:.0f}s" if waited >= _PARKED_S else ""
         return (f"{_c(ts, '90')}    {_c('|', '90')} "
@@ -201,7 +189,6 @@ def tail(path: Path) -> int:
     print(_c("lingling lanes -- live proof", "1"))
     print(_c(f"tailing {path}", "90"))
     print()
-    # this session
     pos = path.stat().st_size if path.exists() else 0
     try:
         while True:
@@ -242,7 +229,7 @@ def spawn_proof_window(log_path: Path) -> bool:
         if os.name == "nt":
             subprocess.Popen(
                 cmd, cwd=cwd,
-                creationflags=subprocess.CREATE_NEW_CONSOLE,  # type: ignore[attr-defined]
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
             )
             return True
         shell_cmd = " ".join(f'"{c}"' for c in cmd)

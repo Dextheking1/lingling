@@ -10,13 +10,10 @@ from __future__ import annotations
 import os
 from typing import List
 
-#: tick floor
 TICK_S = 0.05
 
-#: window ceiling
 WINDOW_S = 86400.0
 
-#: clamped notes
 notes: List[str] = []
 
 

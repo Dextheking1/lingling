@@ -22,13 +22,10 @@ Log = Callable[..., None]
 
 TOR_DIST_URL = "https://archive.torproject.org/tor-package-archive/torbrowser/"
 
-#: sticky release
 _STICKY_S = bounds.number("LINGLING_STICKY_S", 15, 0.0, bounds.WINDOW_S)
 
-#: stick threshold
 _FAST_S = bounds.number("LINGLING_FAST_S", 5, 0.0, bounds.WINDOW_S)
 
-#: port search
 _PORT_SEARCH = 4000
 
 
@@ -49,24 +46,17 @@ def _leftover_ports(pid: int, held: Dict[int, int],
             ports.append(derived)
     return ports
 
-#: rotation cursor
 _ROTATION_MEMORY = 8
 
-#: conflux legs
 CONFLUX = os.environ.get("LINGLING_CONFLUX", "0")
 
-#: drain grace
 _DRAIN_S = 5.0
-#: defer bound
 _DEFER_MAX_S = 120.0
 
-#: move guard
 _MOVE_GUARD_S = 10.0
 
-#: stall floor
 _STREAM_STALL_S = 120.0
 
-#: expansion pool
 EXPAND_COUNTRIES = [
     "de", "nl", "us", "fr", "se", "ch", "at", "ca", "gb", "ro",
     "fi", "pl", "cz", "hu", "bg", "lt", "lv", "ee", "dk", "no",
@@ -99,44 +89,25 @@ class Lane:
     process: Optional[subprocess.Popen] = None
     exit_ip: str = ""
     boot_ok: bool = False
-    #: daemon verdict
     healthy: Optional[bool] = None
-    #: wants tor
     wanted: bool = False
-    #: healing now
     healing: bool = False
     last_circuit_built_ts: float = 0.0
-    #: asked
     asked: bool = False
-    #: last probe
     probe_code: int = -1
-    #: probe reason
     probe_note: str = ""
-    #: probe limit
     probe_reason: str = ""
-    #: failed revive
     down_reported: bool = False
-    #: live tunnels
     active: int = 0
-    #: open streams
     streams: Dict[int, tuple] = field(default_factory=dict)
-    #: deferred move
     deferred_at: float = 0.0
-    #: last retire
     retired_at: float = 0.0
-    #: retired exit
     retired_exit: str = ""
-    #: last pick
     last_used_at: float = 0.0
-    #: last real
     last_real_at: float = 0.0
-    #: server reset
     limited_until: float = 0.0
-    #: bench reason
     limit_reason: str = ""
-    #: pinned relay
     exit_fingerprint: str = ""
-    #: rotation cursor
     recent_countries: List[str] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -173,7 +144,6 @@ class Lane:
 
     def cut_silent(self, floor: Optional[float] = None) -> int:
         """Hang up the clients of this lane's streams that said nothing for ``floor``."""
-        # owed bytes
         quiet_for = _STREAM_STALL_S if floor is None else floor
         now = time.time()
         with self.lock:
@@ -207,7 +177,7 @@ class StickyState:
         self._emit = emit or (lambda e: None)
         self.release_s = release_s
         self._lock = threading.Lock()
-        self.phase = "routing"        # phase
+        self.phase = "routing"
         self.winner: Optional[int] = None
         self._cursor = 0
         self._announced = False
@@ -216,7 +186,6 @@ class StickyState:
         """The proof pane hears the routing and the stick."""
         self._emit = emit or (lambda e: None)
 
-    # routing
     def next_lane(self, exclude: Optional[set] = None) -> Optional[Lane]:
         """The lane this request rides, or None to let ``pick_lane`` decide."""
         with self._lock:
@@ -228,7 +197,6 @@ class StickyState:
                         and not (exclude and lane.index in exclude)):
                     self._touch(lane)
                     return lane
-                # favorite fell
                 self._wake()
             lanes = [l for l in self.tor.healthy_lanes()
                      if l.limited_until <= now
@@ -240,7 +208,6 @@ class StickyState:
             self._cursor += 1
             self._touch(lane)
             if not self._announced:
-                # race begins
                 self._announced = True
                 self._emit({
                     "type": "lane", "kind": "sticky", "t": time.time(),
@@ -256,7 +223,6 @@ class StickyState:
             if self.phase != "routing":
                 return
             if secs <= _FAST_S:
-                # fast enough
                 self._stick(lane_index, secs)
 
     def stuck_on(self, lane_index: int) -> bool:
@@ -270,7 +236,6 @@ class StickyState:
             if self.phase == "stuck" and lane_index == self.winner:
                 self._wake()
 
-    # internals
     def _lane(self, index: Optional[int]) -> Optional[Lane]:
         if index is None:
             return None
@@ -326,7 +291,6 @@ class TorManager(BenchMixin):
         fallback_countries: Optional[List[str]] = None,
         preferred_countries: Optional[List[str]] = None,
         socks_base: int = 52001,
-        # avoid 52101
         control_base: int = 52301,
         tor_exe: str = "",
         boot_timeout: int = 120,
@@ -337,8 +301,6 @@ class TorManager(BenchMixin):
         self.tools_dir = self.root / "tools"
         self.lanes_dir = self.root / "lanes"
         self.count = max(1, count)
-        # random pool
-        # expansion pool
         override = os.environ.get("LINGLING_EXPAND", "").strip().lower()
         self._expand = ([c.strip() for c in override.split(",")
                          if len(c.strip()) == 2] if override
@@ -346,46 +308,32 @@ class TorManager(BenchMixin):
         base = [c for c in (exit_countries or []) if c]
         if not base:
             base = exits.random_countries(self.count, self._expand)
-        # preferred pool
         self._preferred = [c for c in (preferred_countries or []) if c]
         boot = self._preferred or base
         self.countries = [boot[i % len(boot)] for i in range(self.count)]
-        # rotation order
         self._quiet = list(base)
         self._fallback = [c for c in (fallback_countries or [])
                           if c not in self._quiet]
-        #: country score
         self._score: Dict[str, int] = self._load_score()
-        #: relay pool
         self._by_country: Optional[Dict[str, List[exits.Exit]]] = None
-        #: the notepad
         self._limited: Dict[str, Dict] = self._load_limited()
-        #: recent exits
         self._used: Dict[str, float] = self._load_stamps(USED_PATH)
-        #: verified exits
         self._verified: Dict[str, float] = self._load_stamps(VERIFIED_PATH)
         self.socks_base = socks_base
         self.control_base = control_base
         self.tor_exe_override = tor_exe
         self.boot_timeout = boot_timeout
         self.log: Log = log or (lambda *a, **k: None)
-        #: prune opt-in
         self.prune_orphans = prune_orphans
         self.lanes: List[Lane] = []
-        #: limit hook
         self.limit_hook: Optional[Callable[[Lane], None]] = None
-        #: sticky router
         self.sticky = StickyState(self)
-        #: move locks
         self._move_locks: Dict[int, threading.Lock] = {}
         self._move_locks_lock = threading.Lock()
-        #: booting lanes
         self._booting: set = set()
-        #: pane hook
         self._emit: Callable[[Dict], None] = lambda e: None
         self._tor_executable: Optional[Path] = None
         self._stopping = False
-        #: rebuild threads
         self._rebuilds: List[threading.Thread] = []
         self.tools_dir.mkdir(parents=True, exist_ok=True)
         self.lanes_dir.mkdir(parents=True, exist_ok=True)
@@ -395,7 +343,6 @@ class TorManager(BenchMixin):
         """The pane hears the moves this pool makes."""
         self._emit = emit or (lambda e: None)
 
-    # setup
     def _load_existing(self) -> None:
         """Re-read ports from previous torrcs, so a restart keeps the lane layout."""
         seen_socks: set[int] = set()
@@ -423,7 +370,7 @@ class TorManager(BenchMixin):
                         try:
                             val = line.split(None, 1)[1].strip().strip("{}").strip()
                             if val == "*":
-                                exit_cc = "*"  # keep state
+                                exit_cc = "*"
                         except IndexError:
                             pass
             if socks_port in seen_socks or not netutil.bindable(socks_port):
@@ -531,7 +478,6 @@ class TorManager(BenchMixin):
         tmp = self.tools_dir / name
         urllib.request.urlretrieve(f"{TOR_DIST_URL}{latest}/{name}", tmp)
         with tarfile.open(tmp, "r:gz") as tf:
-            # traversal guard
             root = self.tools_dir.resolve()
             for member in tf.getmembers():
                 if not (root / member.name).resolve().is_relative_to(root):
@@ -541,7 +487,6 @@ class TorManager(BenchMixin):
 
     def _lane_config(self, lane: Lane) -> Dict[str, str]:
         cfg = {
-            # isolate slots
             "SocksPort": (f"127.0.0.1:{lane.socks_port} "
                           f"IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth"),
             "ControlPort": f"127.0.0.1:{lane.control_port}",
@@ -549,22 +494,15 @@ class TorManager(BenchMixin):
             "CookieAuthentication": "1",
             "CookieAuthFile": str(lane.cookie_path()),
             "MaxCircuitDirtiness": "600",
-            # connect fails
             "SocksTimeout": "45",
             "CircuitStreamTimeout": "20",
-            # idle circuits
             "KeepalivePeriod": "60",
-            # conflux legs
             "ConfluxEnabled": CONFLUX,
-            # throughput
             "ConnectionPadding": "0",
             "RunAsDaemon": "0",
-            # teardown reasons
             "Log": [f"[circ,edge]info file {lane.data_dir / 'tor.log'}",
-                    # visible progress
                     f"notice file {lane.data_dir / 'boot.log'}"],
         }
-        # geoip pin
         geoip = self._geoip_path()
         if geoip is not None:
             cfg["GeoIPFile"] = str(geoip)
@@ -572,11 +510,10 @@ class TorManager(BenchMixin):
             if geo6 is not None:
                 cfg["GeoIPv6File"] = str(geo6)
             if lane.exit_fingerprint:
-                # pinned relay
                 cfg["ExitNodes"] = "$" + lane.exit_fingerprint
                 cfg["StrictNodes"] = "1"
             elif lane.exit_country == "*":
-                cfg["ExitNodes"] = "*"  # any exit
+                cfg["ExitNodes"] = "*"
             else:
                 cfg["ExitNodes"] = "{" + lane.exit_country + "}"
         return cfg
@@ -585,7 +522,6 @@ class TorManager(BenchMixin):
         lane.data_dir.mkdir(parents=True, exist_ok=True)
         lines = ["# Auto-generated by lingling. Do not edit by hand."]
         for k, v in self._lane_config(lane).items():
-            # repeated directives
             for item in (v if isinstance(v, list) else [v]):
                 lines.append(f"{k} {item}")
         lane.torrc_path().write_text("\n".join(lines) + "\n")
@@ -597,19 +533,15 @@ class TorManager(BenchMixin):
         err = self.ensure_tools()
         if err:
             return err
-        # own ports
         self._reap_orphans()
-        # keep dirs
         if self.prune_orphans:
             self._prune_lane_dirs()
-        # own relay
         for lane in self.lanes:
             self._pin(lane)
         for lane in self.lanes:
             self._write_torrc(lane)
         return None
 
-    # lifecycle
     def start_all(self, on_lane: Optional[Callable[[Lane, str], None]] = None) -> None:
         self.start_lanes(self.lanes, on_lane=on_lane)
 
@@ -660,7 +592,6 @@ class TorManager(BenchMixin):
         if not cookies:
             return False
         if only is not None:
-            # own lane
             wanted = only.resolve()
             own = wanted / "control_auth_cookie"
             cookies.sort(key=lambda p: p != own)
@@ -682,7 +613,6 @@ class TorManager(BenchMixin):
                         deadline.daemon = True
                         deadline.start()
                         try:
-                            # stem quirk
                             stem.connection.authenticate_safecookie(
                                 ctl, cookie_path=str(cookie),
                                 suppress_ctl_errors=False)
@@ -704,7 +634,6 @@ class TorManager(BenchMixin):
                         stem.connection.AuthenticationFailure):
                     continue
                 except Exception as exc:  # noqa: BLE001
-                    # owner proof
                     self.log("orphan probe on %d: %s", port, exc)
                     continue
         return False
@@ -762,7 +691,6 @@ class TorManager(BenchMixin):
         lane.healthy = False
         if not lane.torrc_path().exists():
             self._write_torrc(lane)
-        # fresh logs
         try:
             lane.data_dir.mkdir(parents=True, exist_ok=True)
             lane.data_dir.joinpath("tor.log").write_text("")
@@ -794,7 +722,6 @@ class TorManager(BenchMixin):
         try:
             lane.process = self._launch_tor_process(stem, lane, config, _msg)
         except Exception as exc:  # noqa: BLE001
-            # port heal
             if "Failed to bind one of the listener ports" not in str(exc):
                 self.log("lane #%d launch failed: %s", lane.index, exc)
                 return "failed"
@@ -813,7 +740,6 @@ class TorManager(BenchMixin):
                          lane.index, exc2)
                 return "failed"
 
-        # say so
         if os.name == "nt" and not winjob.ensure_kill_job():
             self.log("kill job unavailable -- tor children may outlive us")
         if lane.process is not None:
@@ -830,7 +756,6 @@ class TorManager(BenchMixin):
         if not netutil.port_is_open("127.0.0.1", lane.socks_port, timeout=0.5):
             return "failed"
         lane.boot_ok = True
-        # the fact
         lane.healthy = True
         return "started"
 
@@ -854,7 +779,6 @@ class TorManager(BenchMixin):
                 result_q.put(("err", exc))
                 return
             if abandoned.is_set():
-                # boot window
                 self._kill(proc)
                 return
             result_q.put(("ok", proc))
@@ -864,7 +788,6 @@ class TorManager(BenchMixin):
         try:
             kind, payload = result_q.get(timeout=self.boot_timeout)
         except queue.Empty:
-            # no bootstrap
             abandoned.set()
             try:
                 kind, payload = result_q.get_nowait()
@@ -896,10 +819,8 @@ class TorManager(BenchMixin):
         if self._stopping:
             return
         self._stopping = True
-        # tor first
         for lane in self.lanes:
             self._stop_lane_process(lane)
-        # whole range
         self._reap_orphans()
         for t in list(self._rebuilds):
             t.join(timeout=5)
@@ -910,10 +831,8 @@ class TorManager(BenchMixin):
         lane.healthy = False
         lane.exit_ip = ""
         lane.asked = False
-        # new exit
         lane.probe_code = -1
         lane.probe_note = ""
-        # on purpose
         lane.wanted = False
         proc = lane.process
         lane.process = None
@@ -1039,15 +958,14 @@ class TorManager(BenchMixin):
         """
         lock = self._move_lock_for(lane)
         if not lock.acquire(blocking=False):
-            return False           # already moving
+            return False
         try:
             now = time.time()
             exit_now = lane.exit_fingerprint
             if lane.healing:
-                return False       # mid-launch
+                return False
             if (now - lane.retired_at < _MOVE_GUARD_S
                     and lane.retired_exit == exit_now):
-                # one exit
                 return False
             lane.retired_at = now
             lane.retired_exit = exit_now
@@ -1076,18 +994,14 @@ class TorManager(BenchMixin):
             return False
         with self._move_lock_for(lane):
             if lane.active > 0 and not now:
-                # streams first
                 self._defer_rebuild(lane, repin)
                 return False
-            # live requests
             self._drain(lane)
             if repin or lane.limited_until > time.time():
                 self._pin(lane)
-            # fresh exit
             lane.forget_limit()
             self._stop_lane_process(lane)
             self._clear_lane_dir_owner(lane)
-            #: torrc follows
             self._write_torrc(lane)
             return self._launch_lane(lane) in ("started", "already_running")
 
@@ -1126,7 +1040,6 @@ class TorManager(BenchMixin):
             self.log("lane #%d has no control port: %s", lane.index, exc)
             return None
         try:
-            # stem quirk
             stem.connection.authenticate_safecookie(
                 ctl, cookie_path=str(lane.cookie_path()),
                 suppress_ctl_errors=False)
@@ -1151,16 +1064,13 @@ class TorManager(BenchMixin):
             return False
         finally:
             ctl.close()
-        #: fresh circuit
         lane.exit_fingerprint = relay.fingerprint
         lane.exit_ip = relay.ip
-        #: another exit
         lane.forget_limit()
         lane.asked = False
         lane.probe_code = -1
         lane.probe_note = ""
         lane.probe_reason = ""
-        #: relay seen
         self._used[relay.fingerprint] = time.time() + USED_TTL_S
         self._save_stamps(USED_PATH, self._used)
         self._write_torrc(lane)
@@ -1169,10 +1079,10 @@ class TorManager(BenchMixin):
     def note_timeout(self, lane: Lane) -> Optional[str]:
         """A timeout means a dead exit: write it off and move the lane at once."""
         if not self.claim_move(lane):
-            return None            # moved already
+            return None
         if lane.limited_until <= time.time():
             self.note_limited(lane)
-        lane.cut_silent()          # cut quiet
+        lane.cut_silent()
         moved = self.rotate_exit_country(lane)
         self._rebuild_async(lane, now=_owes_nobody(lane))
         return (f"lane {lane.index} timed out -- moved to "
@@ -1181,10 +1091,10 @@ class TorManager(BenchMixin):
     def note_ssl_error(self, lane: Lane) -> Optional[str]:
         """An SSL cut means a dead exit: the timeout verdict on the first hit."""
         if not self.claim_move(lane):
-            return None            # moved already
+            return None
         if lane.limited_until <= time.time():
             self.note_limited(lane)
-        lane.cut_silent()          # cut quiet
+        lane.cut_silent()
         moved = self.rotate_exit_country(lane)
         self._rebuild_async(lane, now=_owes_nobody(lane))
         return (f"lane {lane.index} ssl-failed -- moved to "
@@ -1193,10 +1103,10 @@ class TorManager(BenchMixin):
     def note_slow_exit(self, lane: Lane, elapsed: float = 0.0) -> Optional[str]:
         """A first event over the ceiling means a bad exit: the timeout verdict."""
         if not self.claim_move(lane):
-            return None            # moved already
+            return None
         if lane.limited_until <= time.time():
             self.note_limited(lane)
-        lane.cut_silent()          # cut quiet
+        lane.cut_silent()
         moved = self.rotate_exit_country(lane)
         self._rebuild_async(lane, now=_owes_nobody(lane))
         return (f"lane {lane.index} first event {elapsed:.0f}s -- moved to "
@@ -1233,7 +1143,7 @@ class TorManager(BenchMixin):
         """Give a lane its own relay so no two lanes share an exit."""
         if not self._load_exits():
             lane.exit_fingerprint = ""
-            return True  # country-only
+            return True
         avoid = [l.exit_fingerprint for l in self.lanes
                  if l is not lane and l.exit_fingerprint]
         picked = exits.claim(self._by_country or {}, lane.exit_country,
@@ -1243,9 +1153,7 @@ class TorManager(BenchMixin):
             lane.exit_fingerprint = ""
             return False
         lane.exit_fingerprint = picked.fingerprint
-        #: known exit
         lane.exit_ip = picked.ip
-        #: freshness
         self._used[picked.fingerprint] = time.time() + USED_TTL_S
         self._save_stamps(USED_PATH, self._used)
         return True
@@ -1257,10 +1165,9 @@ class TorManager(BenchMixin):
         others = {l.exit_country for l in self.lanes if l is not lane}
         for exhausted in (False, True):
             if exhausted:
-                lane.recent_countries.clear()  # walk again
+                lane.recent_countries.clear()
             for spread in (True, False):
                 for pool in ladders:
-                    # tie break
                     ranked = sorted(
                         [c for c in dict.fromkeys(pool)
                          if c and c != leaving
@@ -1271,11 +1178,9 @@ class TorManager(BenchMixin):
                             continue
                         lane.exit_country = cc
                         if self._pin(lane):
-                            # rotation cursor
                             lane.recent_countries.append(cc)
                             del lane.recent_countries[:-_ROTATION_MEMORY]
                             return cc
-        # unpin
         lane.exit_country = "*"
         lane.exit_fingerprint = ""
         return "*"

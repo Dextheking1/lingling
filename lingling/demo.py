@@ -11,7 +11,6 @@ from .cli import DATA_DIR, load_countries
 from .health import UPSTREAM_HOST, UPSTREAM_UA, HealthDaemon
 from .lanes import TorManager
 
-# version override
 MODEL = os.environ.get("LINGLING_DEMO_MODEL",
                        "muse-spark-1.3-contributor-free")
 
@@ -111,7 +110,6 @@ def _demo_body(manager: TorManager, question: str) -> int:
     dt = time.time() - t0
 
     if code == 429:
-        # which wall
         if netutil.UPSTREAM_UNAVAILABLE in body:
             section = "opencode edge unfair"
         else:
@@ -142,7 +140,6 @@ def _demo_body(manager: TorManager, question: str) -> int:
         manager.stop_all()
         return 1
 
-    # not dict
     if not isinstance(obj, dict):
         _say(f" !! unexpected JSON shape: {body[:200]!r}")
         manager.stop_all()

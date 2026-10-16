@@ -8,33 +8,24 @@ from typing import Dict, Optional
 
 from . import bounds, exits
 
-#: rate stand-off
 RATE_LIMIT_FALLBACK_S = 1500.0
 
-#: bench ceiling
 _LIMIT_CEILING_S = 24 * 3600 + 300
 
-#: notepad sections
 FREE_LIMIT = "free"
 RATE_LIMIT = "rate"
 
-#: limited exits
 LIMITED_PATH = "limited-exits.json"
 
-#: used exits
 USED_PATH = "used-exits.json"
 
-#: country scores
 SCORE_PATH = "country-scores.json"
 
-#: verified exits
 VERIFIED_PATH = "verified-exits.json"
 
-#: freshness window
 USED_TTL_S = bounds.number("LINGLING_FRESH_S", 86400,
                            0.0, 30 * bounds.WINDOW_S)
 
-#: verified window
 VERIFIED_TTL_S = bounds.number("LINGLING_VERIFIED_S", 1800,
                                0.0, 30 * bounds.WINDOW_S)
 
@@ -52,7 +43,6 @@ def bench_span(reason: str, retry_after: float = 0.0,
     if reason == RATE_LIMIT:
         return (min(retry_after, RATE_LIMIT_FALLBACK_S) if retry_after > 0
                 else RATE_LIMIT_FALLBACK_S)
-    # daily wall
     if retry_after > 0:
         return min(retry_after, _LIMIT_CEILING_S)
     return min(next_free_reset(moment) - moment, _LIMIT_CEILING_S)
@@ -75,7 +65,6 @@ class BenchMixin:
         if not country or country == "*":
             return
         if status not in (200, 429):
-            # exit signals
             return
         self._score[country] = self._score.get(country, 0) + (
             1 if status == 200 else -1)
@@ -111,7 +100,6 @@ class BenchMixin:
         now = time.time()
         until = now + bench_span(reason, retry_after, now)
         self._limited[fingerprint] = {"until": until, "reason": reason}
-        #: spent exit
         self._verified.pop(fingerprint, None)
         self._save_stamps(VERIFIED_PATH, self._verified)
         self._save_limited()
@@ -149,7 +137,6 @@ class BenchMixin:
         now = time.time()
         fresh: Dict[str, Dict] = {}
         for fingerprint, entry in raw.items():
-            # older file
             if isinstance(entry, dict):
                 until = entry.get("until")
                 reason = str(entry.get("reason") or "")

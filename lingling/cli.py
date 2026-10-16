@@ -31,7 +31,6 @@ DEFAULT_COUNTRIES = ["us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"]
 
 DEFAULT_LANES = 5
 
-#: lane ceiling
 MAX_LANES = 64
 
 
@@ -40,14 +39,13 @@ def load_countries(path: Optional[Path] = None) -> tuple:
     path = path or (DATA_DIR / "countries.txt")
     if path.exists():
         try:
-            # line order
             text = path.read_text(encoding="utf-8")
             raw = []
             for line in text.splitlines():
                 if "#" in line:
                     line = line.split("#", 1)[0]
                     if not line.strip():
-                        continue  # comment only
+                        continue
                 raw.append(line)
             raw += [""] * (3 - len(raw))
             pools = [[c.strip().lower() for c in raw[i].split(",")
@@ -194,14 +192,12 @@ def _boot_gate(manager: TorManager, first, daemon: HealthDaemon,
     cache_moved = False
     pokes = 0
     while time.time() < deadline:
-        # probe last
         pct = manager.lane_bootstrap_pct(first)
         cache_at = manager.cache_mtime(first)
         if pct > last_pct:
             last_pct = pct
             last_pct_at = time.time()
         elif cache_at > last_cache:
-            # downloading
             last_cache = cache_at
             cache_moved = True
             last_pct_at = time.time()
@@ -212,22 +208,17 @@ def _boot_gate(manager: TorManager, first, daemon: HealthDaemon,
             elif code:
                 first.healthy = True
                 return True
-        # probe ladder
-        # stuck checks
         stall = time.time() - last_pct_at
         limit = download_limit if (cache_moved and pct <= 10) else \
             (quick_limit if pct <= 10 else deep_limit)
         if stall > limit and pokes < 3:
             pokes += 1
             if pct >= 100:
-                # dead exit
                 manager.rotate_exit_country(first)
                 manager.restart_lane(first)
             elif pokes == 1:
-                # fresh relay
                 manager.restart_lane(first, repin=True)
             elif pokes == 2:
-                # new country
                 manager.rotate_exit_country(first)
                 manager.restart_lane(first)
             else:
@@ -396,7 +387,6 @@ def _uninstall(rest: list[str]) -> int:
     if not DATA_DIR.exists():
         print("nothing to remove -- no lingling data dir on this machine.")
         return 0
-    # hand-written
     keep = {p.name for p in DATA_DIR.iterdir()
             if p.name.startswith("countries")}
     entries = []
@@ -419,7 +409,6 @@ def _uninstall(rest: list[str]) -> int:
         try:
             answer = input(f"delete all of it ({_human(total)})? [y/N] ")
         except EOFError:
-            # tty lies
             print("refusing to wipe without --yes in a non-interactive shell.")
             return 1
         if answer.strip().lower() not in ("y", "yes"):
@@ -492,7 +481,6 @@ def main(argv: list[str]) -> int:
 
     if "--version" in opts["passthrough"] or "-v" in opts["passthrough"]:
         print(f"lingling {__version__} (wraps opencode)")
-        # cache only
         update.cached_hint(DATA_DIR)
         return 0
 
@@ -503,14 +491,12 @@ def main(argv: list[str]) -> int:
         print("Install it first (https://opencode.ai) and re-run.")
         return 1
 
-    # fail early
     from . import mitm
     if not mitm.crypto_available():
         print("lingling: the `cryptography` package is missing or broken.")
         print("Reinstall it:  pip install --force-reinstall cryptography")
         return 1
 
-    # single owner
     try:
         other = _other_lingling()
     except OSError as exc:
@@ -530,7 +516,6 @@ def main(argv: list[str]) -> int:
 def _session(opts: dict, opencode: str) -> int:
     _migrate_countries()
     _spawn_geoip_fallback()
-    # boot thread
     update_check = update.start(DATA_DIR)
     loader = _Loader()
     if _cache_is_cold(DATA_DIR):
@@ -545,7 +530,7 @@ def _session(opts: dict, opencode: str) -> int:
     relay: Relay | None = None
     direct = opts["no_tor"]
     end_code: list = []
-    emit = None  # proof sink
+    emit = None
 
     try:
         if not direct:
@@ -557,7 +542,6 @@ def _session(opts: dict, opencode: str) -> int:
                 preferred_countries=preferred,
                 tor_exe=os.environ.get("LINGLING_TOR_EXE", ""),
                 log=lambda *a: None,
-                # product-owned dir
                 prune_orphans=True,
             )
             err = manager.setup_lanes()
@@ -582,7 +566,6 @@ def _session(opts: dict, opencode: str) -> int:
                                  f"did not come up ({status}) -- the health "
                                  f"daemon will keep trying"})
 
-                # first lane
                 first = manager.lanes[0]
                 manager.start_lanes([first], on_lane=_report_boot)
 
@@ -608,14 +591,12 @@ def _session(opts: dict, opencode: str) -> int:
 
         if emit is None:
             emit = proof.make_emitter(PROOF_LOG)
-        # session marker
         emit({"type": "start", "t": time.time(),
               "session": os.urandom(6).hex(), "lanes": len(manager.lanes),
               "countries": list(manager.countries), "version": __version__})
         relay = Relay(manager, event=emit)
         port = relay.start()
 
-        # mitm proof
         ca_pem = None
         if os.environ.get("LINGLING_NO_MITM", "").lower() not in ("1", "true"):
             try:
@@ -632,7 +613,6 @@ def _session(opts: dict, opencode: str) -> int:
         if not opts["no_proof"]:
             proof.spawn_proof_window(PROOF_LOG)
 
-        # background boot
         rest = manager.lanes[1:]
         if rest:
             def _cook_rest() -> None:
@@ -650,7 +630,6 @@ def _session(opts: dict, opencode: str) -> int:
             env[var] = f"http://127.0.0.1:{port}"
         env["NO_PROXY"] = env["no_proxy"] = "localhost,127.0.0.1"
         if ca_pem:
-            # trust CA
             env["NODE_EXTRA_CA_CERTS"] = str(ca_pem)
         code = _run_opencode(opencode, opts["passthrough"], env)
         end_code.append(code)
@@ -671,7 +650,6 @@ def _session(opts: dict, opencode: str) -> int:
         if emit:
             try:
                 if end_code:
-                    # session verdict
                     c = end_code[0]
                     if c == 130:
                         msg = "session ended by Ctrl+C"
@@ -708,7 +686,6 @@ def _spawn_geoip_fallback() -> None:
     threading.Thread(target=_copy, name="geoip-seed", daemon=True).start()
 
 
-#: server era
 _SERVER_ERA: Optional[bool] = None
 
 
@@ -736,7 +713,6 @@ def _server(binary: str, env: dict, action: str) -> None:
         if env.get(name) is not None:
             os.environ[name] = env[name]
     try:
-        # cp1252 trap
         subprocess.run([binary, "service", action], capture_output=True,
                        text=True, encoding="utf-8", errors="replace",
                        timeout=60, creationflags=netutil._NO_WINDOW)
@@ -752,12 +728,10 @@ def _server(binary: str, env: dict, action: str) -> None:
 
 def _run_opencode(binary: str, args: list[str], env: dict | None) -> int:
     """Exec opencode with stdio inherited so it owns the terminal."""
-    # TUI quiet
     print(_c(" handoff: starting opencode -- its TUI loads quietly for a "
              "few seconds.", "90"), flush=True)
     server = env is not None and _uses_background_server(binary)
     if server:
-        # our relay
         _server(binary, env, "restart")
     try:
         try:
@@ -789,6 +763,5 @@ def entry() -> None:
     try:
         sys.exit(main(sys.argv[1:]))
     except KeyboardInterrupt:
-        # short boot
         print(_c(" Ctrl+C -- closing the kitchen.", "90"))
         sys.exit(130)

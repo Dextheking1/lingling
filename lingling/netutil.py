@@ -18,7 +18,6 @@ from . import bounds
 
 PORT_CHECK_TIMEOUT = 1.0
 
-#: quiet spawns
 _NO_WINDOW = 0x08000000
 
 
@@ -26,10 +25,8 @@ def _quiet() -> dict:
     """creationflags that keep a console tool from opening a window."""
     return {"creationflags": _NO_WINDOW} if os.name == "nt" else {}
 
-# opencode edge
 UPSTREAM_UNAVAILABLE = b'"server_error"'
 
-# free wall
 QUOTA_SPENT = b'"FreeUsageLimitError"'
 
 
@@ -64,7 +61,6 @@ def chmod_quiet(path, mode: int) -> None:
 
 def session_lock(data_dir: str) -> Optional[int]:
     """Hold an OS lock until release; None acquired, pid/-1 busy, OSError failed."""
-    # lock guard
     path = pathlib.Path(data_dir).resolve() / "session.lock"
     with _session_mutex:
         if path in _session_handles:
@@ -125,7 +121,6 @@ def release_session_lock(data_dir: str) -> None:
         finally:
             os.close(fd)
 
-#: circuit slots
 SOCKS_SLOTS = bounds.count("LINGLING_SOCKS_SLOTS", 8, 1, 64)
 
 
@@ -136,11 +131,9 @@ def slot_cred(lane_index: int, slot: int) -> Tuple[str, str]:
 
 def lane_cred(lane_index: int) -> Tuple[str, str]:
     """The one circuit a lane's probe and its live traffic share."""
-    # circuit key
     return slot_cred(lane_index, 0)
 
 
-#: SOCKS5 replies
 SOCKS_REPLY_CODES = {
     1: "general SOCKS server failure", 2: "connection not allowed",
     3: "network unreachable", 4: "host unreachable", 5: "connection refused",
@@ -219,7 +212,7 @@ def pids_on_ports(ports: Container[int]) -> dict:
 
 def abort_quiet(sock) -> None:
     """Cut a connection loose, so a read blocked on it lets go at once."""
-    try:                    # stand-in sockets
+    try:
         sock.shutdown(socket.SHUT_RDWR)
     except (OSError, AttributeError):
         pass
@@ -249,7 +242,6 @@ def _recv_exact(sock: socket.socket, n: int,
 def socks5_open(sock: socket.socket, host: str, port: int,
                 cred: Optional[Tuple[str, str]] = None) -> str:
     """SOCKS5 CONNECT on a connected socket; "" on success, else a reason."""
-    # one window
     window = sock.gettimeout()
     deadline = (time.monotonic() + window) if window else None
 
@@ -268,7 +260,6 @@ def socks5_open(sock: socket.socket, host: str, port: int,
             if resp is None or resp[0] != 0x05 or resp[1] != 0x00:
                 return "bad SOCKS5 greeting"
         else:
-            # both methods
             send(bytes([0x05, 0x02, 0x00, 0x02]))
             resp = _recv_exact(sock, 2, deadline)
             if resp is None or resp[0] != 0x05:
@@ -283,11 +274,9 @@ def socks5_open(sock: socket.socket, host: str, port: int,
                     return "SOCKS5 auth refused"
             elif resp[1] != 0x00:
                 return "bad SOCKS5 greeting"
-        # idna hosts
         addr = host.encode("idna")
         send(bytes([0x05, 0x01, 0x00, 0x03, len(addr)])
              + addr + struct.pack("!H", port))
-        # variable reply
         head = _recv_exact(sock, 4, deadline)
         if head is None or head[0] != 0x05:
             return "bad SOCKS5 reply"
