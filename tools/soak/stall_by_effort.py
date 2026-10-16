@@ -11,7 +11,7 @@ from lingling import data_dir  # noqa: E402
 
 DEFAULT = data_dir() / "proof.log"
 
-#: enough stalls per bucket before a split means anything
+#: enough stalls
 MIN_PER_BUCKET = 8
 
 EFFORT = re.compile(r"effort=(\S+)")
@@ -39,8 +39,7 @@ def parse_params(model_field):
     """(effort, cap) out of the `model` string, or ('-', '-')."""
     effort = EFFORT.search(model_field or "")
     cap = CAP.search(model_field or "")
-    return (effort.group(1) if effort else "-",
-            cap.group(1) if cap else "-")
+    return (effort.group(1) if effort else "-", cap.group(1) if cap else "-")
 
 
 def pair(recs):

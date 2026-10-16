@@ -61,7 +61,7 @@ def main():
         sink = Sink()
         mitm._roundtrip(
             Discard(), lane, HOST, 443, "POST", PROBE_PATH,
-            # Both of these are REQUIRED, and omitting either
+            # Both
             {"host": HOST, "content-type": "application/json",
              "user-agent": UPSTREAM_UA},
             _scan_body(PROBE_MODEL, PROBE_PATH),

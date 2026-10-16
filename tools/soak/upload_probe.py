@@ -12,7 +12,7 @@ MODEL = "muse-spark-1.3-contributor-free"
 HOST = "opencode.ai"
 PATH = "/zen/v1/responses"
 
-#: what his own calls carry
+#: what his
 DEFAULT_BYTES = 4_500_000
 
 
@@ -80,11 +80,11 @@ def one(i, lane, body, relay):
     t0 = time.time()
     mitm._roundtrip(
         Discard(), lane, HOST, 443, "POST", PATH,
-        # `host` and `user-agent` are BOTH required. `_roundtrip`
+        # `host`
         {"host": HOST, "accept": "text/event-stream",
          "user-agent": "opencode/1.0"},
         body, sink, 900 + i, 1, t0, relay,
-        # never demolish a lane for a probe
+        # never demolish
         charge_timeout=False)
     return sink.ends[-1] if sink.ends else {}
 
@@ -121,7 +121,7 @@ def main():
                 rows.append(end)
                 show(i + 1, end)
         else:
-            # concurrency IS the production shape: `handle_conn` already runs
+            # concurrency
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=conc) as ex:
                 futs = {ex.submit(one, i, lanes[i % len(lanes)], body, relay): i
@@ -129,7 +129,7 @@ def main():
                 for f in as_completed(futs):
                     try:
                         end = f.result()
-                    except Exception as e:  # noqa: BLE001 - report, not crash
+                    except Exception as e:  # noqa: BLE001
                         end = {"err": f"{type(e).__name__}: {e}"}
                     rows.append(end)
                     show(futs[f] + 1, end)
@@ -142,7 +142,7 @@ def main():
         print(f"  statuses : {[r.get('status') for r in rows]}")
         print(f"  errors   : {[r.get('err') for r in rows]}")
         print()
-        # A send that returns in under a second
+        # send
         took = [r for r in rows if r.get("status")]
         if not took:
             print("  VOID. Not one call got a status: the far end closed before")
@@ -160,7 +160,7 @@ def main():
             print(f"  over the shipped {mitm._SEND_TIMEOUT:.0f}s window: "
                   f"{len(over)} of {len(sents)}")
             old = [s for s in sents if s > 30]
-            # The old wall is the comparison that matters:
+            # old wall
             band = [s for s in sents if 20 <= s <= 30]
             print(f"  over the OLD 30s wall : {len(old)} of {len(sents)}   "
                   f"({len(band)} of them in the 20-30s band)")

@@ -50,8 +50,7 @@ def requests(evs: list, lo: float, hi: float) -> dict:
     host = {}
     for e in evs:
         if e.get("type") == "call" and lo <= e["t"] < hi:
-            # a raced call goes out on every lane it names, and the answer
-            # comes back on one of them
+            # raced call
             for lane in (e.get("lanes") or [e["lane"]]):
                 host[(e["n"], e["c"], lane)] = e.get("host", "?")
     groups = collections.defaultdict(list)
@@ -68,7 +67,7 @@ def label(e: dict) -> str:
     return str(e["status"]) if e.get("err") == "" else str(e.get("err"))
 
 
-#: the two errors that mean the DIAL failed, not the request
+#: two errors
 DIAL = ("timed out", "ConnectionRefusedError")
 
 
@@ -106,9 +105,8 @@ def main() -> int:
         fok = sum(1 for a in fin if a.get("status") == 200 and a.get("err") == "")
         zero = sum(1 for a in att
                    if a.get("err") == "TimeoutError" and a.get("kb") == 0)
-        bad = collections.Counter(label(a) for a in fin
-                                  if label(a) != "200")
-        # reuse and the send window: the two numbers
+        bad = collections.Counter(label(a) for a in fin if label(a) != "200")
+        # reuse
         ru = sum(1 for a in att if a.get("reused"))
         smax = max((a.get("send_s") or 0) for a in att) if att else 0
         dial = sum(1 for a in att if is_dial(a))
@@ -175,7 +173,7 @@ def show(s: dict, evs: list, end: float) -> None:
             continue
         print(f"    n={k[0]} c={k[1]}  host={v[-1].get('_host')}")
         for a in v:
-            # `client_kb` is the field that answers whether a
+            # `client_kb`
             extra = ""
             if a.get("reused"):
                 extra += " reused"

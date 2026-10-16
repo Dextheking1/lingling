@@ -14,14 +14,14 @@ HOST = "opencode.ai"
 RESPONSES = "/zen/v1/responses"
 CHAT = "/zen/v1/chat/completions"
 
-#: the shipped probe default, the model the owner actually rides, a control
+#: shipped probe
 MODELS = [
     "muse-spark-1.3-contributor-free",
     "mimo-v2.6-flash-free",
     "definitely-not-a-real-model-xyz",
 ]
 
-#: what the answer means
+#: what
 MEANING = {
     403: "exit is fine (the gate refused it) -- limit check passed",
     429: "this exit's quota is spent",

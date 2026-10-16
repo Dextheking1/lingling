@@ -12,11 +12,11 @@ MODEL = "muse-spark-1.3-contributor-free"
 HOST = "opencode.ai"
 PATH = "/zen/v1/responses"
 
-#: tiny on purpose -- the question is the tunnel, not the upload
+#: tiny
 BODY = ('{"model":"' + MODEL + '","stream":true,"input":[{"role":"user",'
         '"content":[{"type":"input_text","text":"hi"}]}]}').encode()
 
-#: `host` AND `user-agent` are both required: `_roundtrip` rebuilds the head
+#: `host`
 HEADERS = {"host": HOST, "accept": "text/event-stream",
            "user-agent": "opencode/1.0"}
 
@@ -53,7 +53,7 @@ def main():
             events = []
             mitm._roundtrip(Discard(), lane, HOST, 443, "POST", PATH, HEADERS,
                             BODY, events.append, 900 + i, 1, time.time(), relay,
-                            # never demolish a lane for a probe
+                            # never demolish
                             charge_timeout=False)
             end = [e for e in events if e.get("type") == "callend"]
             end = end[-1] if end else {}
@@ -65,7 +65,7 @@ def main():
         done = [r for r in rows if r.get("status")]
         reu = sum(1 for r in rows if r.get("reused"))
 
-        # the first visit to a lane is COLD
+        # first visit
         seen, possible, hit = set(), [], 0
         for r in rows:
             lane = r.get("lane")

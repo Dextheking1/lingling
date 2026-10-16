@@ -1,4 +1,4 @@
-"""Live soak: boot the real stack, then drive the REAL opencode client through the relay until ~N ..."""
+"""Live soak: boot the real stack and drive the real client through it."""
 import json
 import os
 import shutil
@@ -13,16 +13,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lingling import cli, mitm, netutil, proof
 from lingling.cli import DATA_DIR, load_countries
-from lingling.health import HealthDaemon
+from lingling.health import ExitSweep, HealthDaemon
 from lingling.lanes import TorManager
 from lingling.relay import Relay
 
-MODEL = "muse-spark-1.3-contributor-free"
+#: the model every run asks for; the free tier's real names are per-account
+MODEL = os.environ.get("SOAK_MODEL", "muse-spark-1.3-contributor-free")
 PROOF_LOG = DATA_DIR / "proof.log"
-#: A hung run must not outlive this.
+#: hung run
 RUN_TIMEOUT = 180.0
 
-#: Two prompt pools, because the stall needs LONG reasoning answers.
+#: Two prompt
 PROMPTS = [
     "Reply with exactly: PROOF_OK",
     "Reply with exactly: LANE_1",
@@ -36,7 +37,7 @@ PROMPTS = [
     "Reply with exactly: FINE",
 ]
 
-#: Long-reasoning prompts: each wants a real derivation, not a token.
+#: Long-reasoning prompts
 HARD_PROMPTS = [
     "Derive the time complexity of a red-black tree insertion, proving each "
     "step, then compare it against a B-tree with the same key count.",
@@ -62,7 +63,7 @@ def boot(wait_healthy=4, timeout=420):
     err = mgr.setup_lanes()
     assert not err, f"setup_lanes: {err}"
     emit = proof.make_emitter(PROOF_LOG)
-    #: session marker, as the CLI emits -- without it a soak run cannot be
+    #: session marker
     emit({"type": "start", "t": time.time(), "session": os.urandom(6).hex(),
           "lanes": len(mgr.lanes), "countries": list(mgr.countries),
           "version": "soak"})
@@ -90,11 +91,11 @@ def boot(wait_healthy=4, timeout=420):
     relay.cert_shop = mitm.CertShop(DATA_DIR / "mitm")
     relay.tunnels = mitm.TunnelPool()
     print(f"[boot] relay port: {port}", flush=True)
-    return mgr, daemon, relay, port
+    return mgr, daemon, relay, port, emit
 
 
 class LogTail:
-    """Incremental reader so we can watch model calls land without re-parsing a multi-megabyte log on ..."""
+    """Incremental reader, so the log is not re-parsed on every poll."""
 
     def __init__(self, path):
         self.path = path
@@ -131,7 +132,7 @@ class LogTail:
             t = r.get("type")
             if t == "call":
                 self.calls += 1
-                # a raced call names every lane it went out on
+                # raced call
                 self.call_lanes.extend(r.get("lanes") or [r.get("lane")])
             elif t == "callend":
                 self.ends.append(r)
@@ -149,17 +150,9 @@ def kill_tree(pid):
 
 
 class Killer:
-    """One hard kill, mid-soak: the revive path, exercised on every run.
+    """One hard kill, mid-soak: the revive path, exercised on every run"""
 
-    A tor that dies while the session is up used to leave nothing behind --
-    no revive, no line in the pane, and a lane that never served again.
-    Killing one on purpose is how a soak proves that path still works, with
-    nobody watching.
-    """
-
-    # The kill has to land well inside the run: a soak that reaches its
-    # target in under a minute never fired it at 60s, so the revive path
-    # went untested in exactly the short, fast runs.
+    # kill has
     def __init__(self, mgr, lane_index=2, at_s=12.0):
         self.mgr = mgr
         self.lane_index = lane_index
@@ -193,14 +186,10 @@ class Killer:
 
 
 def warmup(oc, env, timeout=150.0):
-    """One proxied model call, so the load never measures a cold server.
-
-    Returns the first status the relay saw, or the failure in words. A
-    server that has just been restarted refuses the first calls with 403
-    for about ten seconds; the pool is not involved in that at all.
-    """
+    """A just-restarted server refuses its first calls with 403 for ~10s."""
     spec = "opencode/" + MODEL
     spec += "#" + os.environ.get("SOAK_VARIANT", "high")
+    print(f"[soak] model: {spec}", flush=True)
     mark = LogTail(PROOF_LOG)
     try:
         subprocess.run([oc, "run", "-m", spec, "Reply with exactly: OK"],
@@ -223,20 +212,13 @@ def run_once(oc, env, i, pool=None):
     t0 = time.monotonic()
     prompts = pool or PROMPTS
     prompt = prompts[i % len(prompts)]
-    hard = prompts is HARD_PROMPTS
     try:
-        # The effort rides the MODEL string: opencode's `-m` is
-        # `provider/model#variant`, and `opencode run` has no --variant flag,
-        # so asking for it as a flag made every hard run exit before a
-        # single model call.
-        spec = "opencode/" + MODEL
-        if hard:
-            spec += "#" + os.environ.get("SOAK_VARIANT", "high")
+        # effort rides
+        spec = "opencode/" + MODEL + "#" + os.environ.get("SOAK_VARIANT",
+                                                          "high")
         cmd = [oc, "run", "-m", spec]
         cmd.append(prompt)
-        # opencode's output is UTF-8: `text=True` alone decodes it as cp1252
-        # on Windows and the reader thread dies on the first box character,
-        # which killed every run before its model call could be logged.
+        # opencode's output
         proc = subprocess.Popen(
             cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",
@@ -254,19 +236,24 @@ def run_once(oc, env, i, pool=None):
 def main():
     argv = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
-    #: created before the boot, so one reader owns the whole run: the launch
-    #: lines, the warm-up, the load and every lane event in between.
+    #: created before
     tail = LogTail(PROOF_LOG)
     target = int(argv[0]) if argv else 400
     conc = int(os.environ.get("SOAK_CONCURRENCY", "5"))
     budget = float(os.environ.get("SOAK_BUDGET_S", "2700"))
-    # `--hard` is what makes the soak able to
+    # `--hard`
     pool = HARD_PROMPTS if "--hard" in flags else PROMPTS
     print(f"[soak] prompt pool: "
           f"{'HARD (long reasoning)' if pool is HARD_PROMPTS else 'short'}"
           f"  target={target}", flush=True)
 
-    mgr, daemon, relay, port = boot()
+    mgr, daemon, relay, port, emit = boot()
+    #: a session
+    sweep = ExitSweep(mgr, event=emit, log=lambda *a: None)
+    sweep.start()
+    print(f"[soak] exit sweep: "
+          f"{'off' if sweep.interval <= 0 else f'{sweep.interval:.0f}s'}",
+          flush=True)
     ca = str(DATA_DIR / "mitm" / "ca.pem")
     oc = shutil.which("opencode")
     if oc is None:
@@ -276,20 +263,12 @@ def main():
     env["HTTP_PROXY"] = f"http://127.0.0.1:{port}"
     env["NO_PROXY"] = "localhost,127.0.0.1"
     env["NODE_EXTRA_CA_CERTS"] = ca
-    """From opencode 2.0.26 the call is made by a background server that
-    keeps the environment it was born with, so a proxy handed to the client
-    never reaches the model. This is the product's own handoff: the server
-    is restarted under our environment, and stopped again on the way out so
-    no server is left holding a relay port that no longer exists."""
+    # opencode 2.0.26's
     server = cli._uses_background_server(oc)
     if server:
         cli._server(oc, env, "restart")
 
-    """A server restarted under the proxy answers its first model calls
-    with 403 ("the free tier can only be used from within OpenCode") until
-    it is warm -- measured: 34 of 34 calls refused between 7s and 17s after
-    a restart, none after. That is the server's own startup, not the pool,
-    so one call is sent and waited out before the load begins."""
+    # restarted server
     warm = warmup(oc, env)
     print(f"[soak] first call after the restart: {warm}", flush=True)
 
@@ -297,7 +276,9 @@ def main():
     if "--kill" in flags:
         killer = Killer(mgr, int(os.environ.get("SOAK_KILL_LANE", "2")),
                         float(os.environ.get("SOAK_KILL_AT", "12")))
-    print(f"[soak] target={target} model calls  concurrency={conc}  "
+    print(f"[soak] model=opencode/{MODEL}#"
+          f"{os.environ.get('SOAK_VARIANT', 'high')}  "
+          f"target={target} model calls  concurrency={conc}  "
           f"budget={budget:.0f}s"
           + (f"  hard-kill lane {killer.lane_index} at {killer.at_s:.0f}s"
              if killer else ""), flush=True)
@@ -330,7 +311,7 @@ def main():
                       flush=True)
         for f in pending:
             f.cancel()
-        # Short drain: a long one only waits on
+        # Short drain
         done, _ = wait(pending, timeout=30)
         for f in done:
             if not f.cancelled():
@@ -352,7 +333,7 @@ def main():
     print("=" * 60, flush=True)
     print(f"opencode rc  : {dict(rcs)}   (rc=0 = {oks}/{len(results)})")
     print(f"call statuses: {dict(codes)}")
-    # A 200 that the far end cut mid-body
+    # 200
     ok200 = sum(1 for e in tail.ends
                 if e.get("status") == 200 and e.get("err") == "")
     tot = max(1, len(tail.ends))
@@ -364,7 +345,7 @@ def main():
     if secs:
         print(f"latency      : p50={pct(secs, 0.5):.1f}s "
               f"p90={pct(secs, 0.9):.1f}s max={secs[-1]:.1f}s")
-    # 0 means the attempt never got that far,
+    # 0 means
     fbs = sorted(e.get("first_byte_s") for e in tail.ends
                  if e.get("first_byte_s"))
     fes = sorted(e.get("first_event_s") for e in tail.ends
@@ -375,7 +356,7 @@ def main():
     if fes:
         print(f"first event  : p50={pct(fes, 0.5):.2f}s "
               f"p90={pct(fes, 0.9):.2f}s max={fes[-1]:.2f}s (n={len(fes)})")
-    # A reused tunnel skips the SOCKS5 CONNECT and
+    # reused tunnel
     reuse = [e for e in tail.ends if e.get("reused")]
     if reuse:
         print(f"tunnel reuse : {len(reuse)} of {len(tail.ends)} calls "
@@ -388,7 +369,7 @@ def main():
         small = sum(1 for k in kbs if k < 2)
         print(f"payload      : median={sorted(kbs)[len(kbs) // 2]}KB  "
               f"under 2KB={100 * small / len(kbs):.0f}%  max={max(kbs)}KB")
-    #: dispatched, not finished -- a callend can be lost if the tail starts
+    #: dispatched, not
     lanes_used = Counter(tail.call_lanes)
     print(f"lane spread  : {dict(sorted(lanes_used.items()))}")
     print(f"throughput   : {elapsed / max(1, tail.calls):.2f}s per model call")
@@ -397,17 +378,18 @@ def main():
     kinds = Counter(e.get("kind") for e in tail.lanes)
     print(f"lane events: {dict(kinds) if kinds else 'none'}")
     for e in tail.lanes:
-        # `probe` is included deliberately: it means the health
+        # `probe`
         if e.get("kind") in ("limited", "rotate", "up", "fail", "probe"):
             print(f"  [{e.get('kind')}] {e.get('msg')}", flush=True)
 
     if server:
         cli._server(oc, env, "stop")
+    sweep.stop()
     daemon.stop()
     relay.stop()
     mgr.stop_all()
 
-    # Did anything survive? A straggler holds its lane's
+    # Did anything
     import subprocess as _sp
     _tl = _sp.run(["tasklist", "/FO", "CSV", "/NH"],
                   capture_output=True, text=True).stdout
@@ -417,12 +399,7 @@ def main():
         print("           ^ a straggler survived stop_all -- it will block a "
               "lane next run", flush=True)
 
-    """The soak judges itself.
-
-    Counters alone let a silent failure through, and a silent failure is
-    what cost four lanes a whole session: nothing in the pane said they
-    were gone. These checks fail the run instead of leaving it to a reader.
-    """
+    # soak judges
     print("\n--- verdict ---", flush=True)
     try:
         text = PROOF_LOG.read_bytes()[tail.start_off:].decode(

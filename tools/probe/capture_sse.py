@@ -67,7 +67,7 @@ def one_call(port, tag):
     status = rhead.split(b" ", 2)[1].decode()
     print(f"  [{tag}] HTTP {status}", flush=True)
     if status != "200":
-        # drain briefly, show what it said
+        # drain briefly
         rest = b""
         up.settimeout(10)
         try:
@@ -85,7 +85,7 @@ def one_call(port, tag):
     chunked = b"chunked" in rhead.lower()
     up.settimeout(READ_TIMEOUT)
     evs = []          # logged chunks
-    raw = b""         # full reassembled body
+    raw = b""  # full reassembled
     total = 0
     while True:
         try:
@@ -107,7 +107,7 @@ def one_call(port, tag):
     (OUT / f"{tag}.chunks.json").write_text(json.dumps(evs, indent=1))
     print(f"  [{tag}] {total}B in {time.time() - t0:.1f}s -> {tag}.bin", flush=True)
 
-    # which event names appeared
+    # which event
     names = {}
     import re
     for m in re.findall(rb'"type"\s*:\s*"([a-z_.]+)"', raw):
@@ -141,7 +141,7 @@ def main():
     if not ready:
         print("[boot] no lane came up -- aborting", flush=True)
         return
-    # every call rides the lanes that actually answered
+    # every call
     lanes = ready
 
     results = []

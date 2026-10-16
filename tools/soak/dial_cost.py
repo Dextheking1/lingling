@@ -9,7 +9,7 @@ from lingling import data_dir
 LOG = pathlib.Path(
     os.environ.get("LINGLING_DATA_DIR", str(data_dir()))) / "proof.log"
 
-#: `socks5_open` returns the string; the exceptions are something else
+#: `socks5_open` returns
 DIAL = ("timed out", "ConnectionRefusedError")
 
 
@@ -156,7 +156,7 @@ def main():
         print("  the lane not still booting (`healing` already tells you).")
 
     print("\n=== 4. would a tally ever FIRE? ===")
-    # Even if he decides to count dial failures,
+    # Even
     per_lane = collections.defaultdict(list)
     for s, lst in seq.items():
         for a in sorted(lst, key=lambda x: x["t"]):
@@ -172,7 +172,7 @@ def main():
             for a in lst:
                 if pred(a):
                     run += 1
-                    if run >= 3:          # only from the 3rd onward is it "saved"
+                    if run >= 3:  # only
                         caught += (a["end"] or {}).get("secs") or 0
                 else:
                     if run:
