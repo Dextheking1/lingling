@@ -56,7 +56,7 @@ def main():
     check("it is an empty body, not a failure", got == b"", repr(got))
 
     print("\n=== the client closes mid-body ===")
-    # 13 bytes promised, 5 delivered
+    # 13 bytes
     short = Reader(b'{"mod')
     got = mitm._read_body(short, {"content-length": "13"})
     was = old_logic(Reader(b'{"mod'), {"content-length": "13"})

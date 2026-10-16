@@ -1,24 +1,4 @@
-"""opencode's background server, not the TUI, makes the model calls.
-
-From 2.0.26 opencode is a thin TUI over a long-lived background server, and
-that server keeps the environment it was BORN with. lingling sets HTTPS_PROXY
-on the process it launches, but the server is a different process -- so a
-server born outside lingling carries no proxy, and every model call leaves
-without a lane: the proof pane stays empty, and the exit the free tier
-counts is the real IP.
-
-Two things were measured on this machine, and both are pinned here:
-
-* `--standalone` is NOT the answer. Its private server proxied 0 calls where
-  the shared server proxied 28 -- it drops the environment too.
-* a detached server only inherits a proxy through an INHERITED environment
-  block. Passing `env=` proxied 0 calls; setting the variables in our own
-  environment and letting the child inherit proxied 12. This is the one the
-  first attempt got wrong.
-
-So the server is restarted under our environment before the TUI connects,
-and stopped on the way out so no later opencode inherits a dead relay port.
-"""
+"""opencode 2.0.26's server keeps the environment it was BORN with."""
 import contextlib
 import io
 import os

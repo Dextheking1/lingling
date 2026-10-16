@@ -132,8 +132,9 @@ class FakeTor:
     def __init__(self):
         self.limited = []
 
-    def note_limited(self, lane, retry_after=0.0):
-        self.limited.append((lane.index, retry_after))
+    def note_limited(self, lane, retry_after=0.0, reason="rate",
+                     fingerprint=""):
+        self.limited.append((lane.index, retry_after, reason))
         lane.limited_until = mitm.time.time() + (retry_after or 600.0)
 
     def note_result(self, country, status):
@@ -148,10 +149,20 @@ class FakeLane:
         self.index = index
         self.exit_country = "de"
         self.exit_ip = f"1.2.3.{index}"
+        self.exit_fingerprint = f"{index:040X}"
         self.socks_port = 9050 + index
         self.lock = threading.Lock()
         self.active = 0
+        self.streams = {}
         self.limited_until = 0.0
+
+    def track_stream(self, sock, progress, hangup=None):
+        with self.lock:
+            self.streams[id(sock)] = (sock, progress, None)
+
+    def drop_stream(self, sock):
+        with self.lock:
+            self.streams.pop(id(sock), None)
 
 
 class FakeRelay:
@@ -169,11 +180,11 @@ class FakeRelay:
                 return lane
         return None
 
-    def report_refused(self, lane, status):
+    def report_refused(self, lane, status, fingerprint=""):
         self.refused.append((lane.index, status))
 
     def any_unlimited(self, exclude):
-        # every lane is limited, so the pool is
+        # every lane
         return False
 
 
@@ -264,18 +275,29 @@ check("200 streams as before", out200[1] == 200, str(out200[1]))
 check("the note key is present and empty", events200[-1].get("note") == "",
       repr(events200[-1].get("note")))
 
-print("\n=== D. one round over the whole pool, then the far end's 503 ===")
-# A request now goes out on every lane at once, so a 503 from the edge is
-# seen by the whole pool in one round instead of one lane at a time.
+print("\n=== D. the pool walks in waves, then the far end's 503 ===")
+# shipped shape
+WAVE = mitm._RACE_WIDTH or 5  # 0 =
 (client, events, relay) = serve([S503] * 5, n_lanes=5)
 ends = [e for e in events if e.get("type") == "callend"]
 calls = [e for e in events if e.get("type") == "call"]
-check("one round covered every lane", len(relay.dials) == 5,
-      str(len(relay.dials)))
-check("every lane saw the 503", [e["status"] for e in ends] == [503] * 5,
-      str([e["status"] for e in ends]))
-check("and the pane saw one call, not one per lane", len(calls) == 1,
-      str(len(calls)))
+waves = [c.get("lanes") or [] for c in calls]
+print(f"  waves={waves} dials={len(relay.dials)} "
+      f"statuses={[e['status'] for e in ends]}")
+check("no wave is wider than the wave width",
+      bool(waves) and all(len(w) <= WAVE for w in waves), str(waves))
+check("no lane is raced twice, however many waves go out",
+      len({i for w in waves for i in w}) == sum(len(w) for w in waves),
+      str(waves))
+check("the waves stop at the 5xx attempt cap, not at the pool",
+      len(relay.dials) == min(5, WAVE * mitm._5XX_ATTEMPTS),
+      f"dials={len(relay.dials)} width={mitm._RACE_WIDTH} "
+      f"cap={mitm._5XX_ATTEMPTS}")
+check("every lane that was dialled saw the 503",
+      [e["status"] for e in ends] == [503] * len(relay.dials),
+      f"dials={len(relay.dials)} statuses={[e['status'] for e in ends]}")
+check("and the pane saw one call per wave, not one per lane",
+      len(calls) <= max(1, mitm._5XX_ATTEMPTS), str(len(calls)))
 check("the client got the far end's own 503, head first",
       client.got.startswith(b"HTTP/1.1 503"), repr(client.got[:40]))
 check("with the body after it", b"edge is unwell" in client.got,
@@ -313,8 +335,11 @@ S500 = (b"HTTP/1.1 500 Internal Server Error\r\n"
         b"content-type: application/json\r\ncontent-length: 9\r\n\r\n"
         b'{"e":"x"}')
 (client, events, relay) = serve([S500], n_lanes=3)
-check("only the lane that answered talked to the far end",
-      len(relay.dials) == 1, str(len(relay.dials)))
+calls = [e for e in events if e.get("type") == "call"]
+check("no further wave follows a plain 500", len(calls) == 1,
+      f"calls={len(calls)} -- the far end was asked again")
+check("so only the raced wave talked to the far end",
+      len(relay.dials) <= (mitm._RACE_WIDTH or 3), str(len(relay.dials)))
 check("the 500 went straight out",
       client.got.startswith(b"HTTP/1.1 500"), repr(client.got[:40]))
 check("its body reached the client verbatim", b'{"e":"x"}' in client.got,

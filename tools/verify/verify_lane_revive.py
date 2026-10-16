@@ -1,8 +1,4 @@
-"""A lane that is down must be brought back, not skipped forever.
-
-And a lane somebody is waiting on must not be torn down under them: a
-verdict can wait for the streams still running through that lane.
-"""
+"""A lane that is down must be brought back, not skipped forever"""
 import socket
 import sys
 import tempfile
@@ -90,7 +86,7 @@ def main():
     check("and nothing is reported about it", events == [], str(events))
 
     print("\n=== a lane that is MID-LAUNCH must not be restarted ===")
-    # `_launch_lane` sets healthy=False at the start and takes
+    # `_launch_lane` sets
     tor, events = drive([lane(5, process=FakeProc(alive=True), healthy=False,
                               wanted=True, healing=True)])
     print(f"  restarted={tor.restarted}  events={len(events)}")
@@ -99,8 +95,7 @@ def main():
           f"restarted={tor.restarted} -- the daemon killed a booting lane")
 
     print("\n=== a lane that is up AND listening is left alone ===")
-    # It has to really listen: a lane with nothing on its own SOCKS port is
-    # down however alive its process handle looks.
+    # has
     with socket.socket() as srv:
         srv.bind(("127.0.0.1", 0))
         srv.listen()
@@ -111,10 +106,7 @@ def main():
         check("left alone", tor.restarted == [], f"restarted={tor.restarted}")
 
     print("\n=== a lane whose own port is GONE is brought back ===")
-    # Its tor died, or the port moved out from under it. The probe was the
-    # only thing that noticed, and "nothing came back" is deliberately not
-    # a verdict about the lane -- so it was never revived and never served
-    # again, while every request to it bounced off a closed port.
+    # tor died
     tor, events = drive([lane(6, process=FakeProc(alive=True), healthy=True,
                               wanted=True)])
     print(f"  restarted={tor.restarted}  events={len(events)}")
@@ -127,10 +119,7 @@ def main():
           f"no lane event: {events}")
 
     print("\n=== a lane that CANNOT be brought back must say so ===")
-    # Its tor outlived its stop and still holds the lane's data directory,
-    # so every relaunch fails. Reporting only a success made that look
-    # exactly like a lane that was simply never needed -- four dead lanes
-    # spent a whole session invisible.
+    # tor outlived
     class Failing(FakeTor):
         def restart_lane(self, lane, repin=False):
             self.restarted.append(lane.index)
@@ -155,7 +144,7 @@ def main():
           f"down events={len(downs)} -- the pane would be flooded")
 
     print("\n=== orphaned tor processes are reaped before any lane launches ===")
-    # A tor that outlived its lingling holds its
+    # tor
     from lingling import netutil
     from lingling.lanes import TorManager
 
@@ -175,7 +164,7 @@ def main():
     def fake_pids(ports):
         ports = list(ports)
         seen["asked"] = ports
-        # Only ports we were ASKED about. A real
+        # Only ports
         want = set(ports)
         return {p: pid for p, pid in ((52003, 111), (9999, 222)) if p in want}
 
@@ -198,14 +187,12 @@ def main():
     check("it asks the authenticated shutdown helper about the leftover",
           killed == [111],
           f"killed={killed}")
-    # 52003 is a SOCKS port whose lane is 3, so the matching control port is
-    # 52303. A stray that still holds 52003 answers on 52303 and nowhere the
-    # current torrcs name -- asking only about the torrcs is how it survived.
+    # 52003
     check("and it offers the control port that stray is actually on",
           offered == [[52303]],
           f"offered={offered} -- the stray's own port was never offered, so "
           f"it could never be authenticated")
-    # The scoping guarantee: it never even ASKS about
+    # scoping guarantee
     lo = min(asked) if asked else 0
     hi = max(asked) if asked else 0
     check("and it only ever asks about ports in the lane range",
@@ -213,7 +200,7 @@ def main():
           f"asked about {lo}..{hi} -- outside the lane range")
 
     print("\n=== lane dirs for lanes the pool does not have are pruned ===")
-    # A lane dir is ~47 MB, almost all
+    # lane dir
     import tempfile
     from lingling.lanes import TorManager as _TM
 
@@ -221,7 +208,7 @@ def main():
     for n in range(1, 6):
         (tmp / f"tor-{n}").mkdir()
         (tmp / f"tor-{n}" / "cached-microdescs").write_text("x" * 100)
-    (tmp / "keepme").mkdir()               # not a lane dir
+    (tmp / "keepme").mkdir()  # not
     (tmp / "tor-notanumber").mkdir()       # matches nothing
 
     class Mgr2:
@@ -247,10 +234,7 @@ def main():
           f"left={left}")
 
     print("\n=== a smaller pool must not wipe the other lanes' caches ===")
-    # A lane dir is ~47 MB of guard and consensus state that came over the
-    # network. Any tool that builds a one-lane pool -- a probe, a verify
-    # suite, a REPL -- used to delete a real install's other lanes, which
-    # is both slow to rebuild and invisible until the next boot.
+    # lane dir
     tmp2 = Path(tempfile.mkdtemp(prefix="lingling-keep-"))
     for n in range(1, 6):
         d = tmp2 / "lanes" / f"tor-{n}"
@@ -258,8 +242,7 @@ def main():
         (d / "cached-microdescs").write_text("x" * 100, encoding="utf-8")
 
     probe = _TM(tmp2, count=1, exit_countries=["de"], log=lambda *a: None)
-    # setup_lanes() is the destructive path; its gate is this flag, so
-    # checking the flag is checking the gate itself.
+    # setup_lanes()
     check("a fresh manager does not opt into pruning",
           probe.prune_orphans is False,
           "prune_orphans defaulted to True -- a probe would delete lanes")
@@ -269,7 +252,7 @@ def main():
           kept == [f"tor-{n}" for n in range(1, 6)],
           f"kept={kept} -- a smaller pool wiped a bigger install")
 
-    # The product opts in, so reclaiming disk on a shrink still works.
+    # product opts
     owner = _TM(tmp2, count=2, exit_countries=["de"], log=lambda *a: None,
                 prune_orphans=True)
     check("the product can still opt in", owner.prune_orphans is True)
@@ -279,10 +262,7 @@ def main():
           after == ["tor-1", "tor-2"], f"after={after}")
 
     print("\n=== a loaded lane is not torn down under its streams ===")
-    # One thirty-second timeout on a metadata fetch, queued behind thirty
-    # live answers, retired the lane -- and the recook that followed cut
-    # all thirty five seconds later, each one reported as its own failure.
-    # A verdict on a lane somebody is waiting on can wait for them.
+    # One thirty-second
     from lingling.lanes import TorManager
     droot = Path(tempfile.mkdtemp(prefix="lingling-drain-"))
     mgr = TorManager(droot, count=1, exit_countries=["de"],

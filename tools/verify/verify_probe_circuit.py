@@ -1,12 +1,4 @@
-"""The probe must warm the circuit the requests ride, not its own.
-
-A credential that changes per request makes Tor build a three-hop circuit
-every call. A probe that dials without the lane's credential builds a
-circuit no request ever touches, so its warmth is spent on nothing.
-
-Two halves: the source invariant (static), and the transport fact it
-depends on (live) -- one credential, reused across separate connections.
-"""
+"""The probe must warm the circuit the requests ride, not its own"""
 import ast
 import socket
 import sys
@@ -201,7 +193,7 @@ def live_checks():
             return False
         held.append(a)
 
-        # second connection, same credential
+        # second connection
         err2, b = dial(lane, cred)
         check("a later connection reuses the credential", err2 == "",
               f"err={err2!r}")

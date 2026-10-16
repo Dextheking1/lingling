@@ -146,9 +146,19 @@ def run(port, ceiling=20.0, first_byte=30.0):
         index = 1
         exit_country = "de"
         exit_ip = "1.2.3.4"
+        exit_fingerprint = "F" * 40
         socks_port = port
         lock = threading.Lock()
         active = 0
+        streams = {}
+
+        def track_stream(self, sock, progress, hangup=None) -> None:
+            with self.lock:
+                self.streams[id(sock)] = (sock, progress, hangup)
+
+        def drop_stream(self, sock) -> None:
+            with self.lock:
+                self.streams.pop(id(sock), None)
 
     class Tap:
         """Stands in for the client socket; records what reached it."""
@@ -226,7 +236,7 @@ def case_connect_silent(c):
 
 
 def main():
-    # Short windows so the proof runs in seconds;
+    # Short windows
     ceiling, first_byte = 5.0, 8.0
 
     print("=== (A0) per-read, not cumulative: 6 bytes 1.5s apart, "

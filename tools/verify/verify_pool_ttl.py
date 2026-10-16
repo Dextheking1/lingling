@@ -13,7 +13,7 @@ from lingling import mitm  # noqa: E402
 
 FAILS = []
 
-#: the owner's measured same-lane lap, p75
+#: owner's measured
 LAP_S = 150.0
 
 _real_monotonic = clock.monotonic
@@ -40,9 +40,19 @@ class Lane:
     index = 1
     exit_country = "de"
     exit_ip = "1.2.3.4"
+    exit_fingerprint = "F" * 40
     socks_port = 0
     lock = threading.Lock()
     active = 0
+    streams = {}
+
+    def track_stream(self, sock, progress, hangup=None) -> None:
+        with self.lock:
+            self.streams[id(sock)] = (sock, progress, None)
+
+    def drop_stream(self, sock) -> None:
+        with self.lock:
+            self.streams.pop(id(sock), None)
 
 
 def pair():
@@ -153,7 +163,7 @@ def drive(payload):
 
 def main():
     print("=== A. the shipped TTL survives a lap ===")
-    pool = mitm.TunnelPool()          # shipped default, not an argument
+    pool = mitm.TunnelPool()  # shipped default
     got = idle_for(pool, LAP_S)
     print(f"  shipped TTL={mitm._KEEPALIVE_S}s  idle={LAP_S}s  "
           f"reused={'yes' if got else 'no'}")

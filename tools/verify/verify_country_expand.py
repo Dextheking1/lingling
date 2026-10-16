@@ -1,4 +1,4 @@
-"""Offline proof that country rotation walks the pool and then widens it, and that live lane picking ..."""
+"""Country rotation walks the pool, then widens it."""
 import json
 import sys
 import tempfile
@@ -10,8 +10,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from lingling import exits, netutil
+from lingling.bench import LIMITED_PATH
 from lingling.cli import DATA_DIR, load_countries
-from lingling.lanes import LIMITED_PATH, Lane, TorManager
+from lingling.lanes import Lane, TorManager
 from lingling.relay import Relay
 
 
@@ -28,17 +29,22 @@ def build(count=6):
     mgr._fallback = ["dd", "ee"]
     mgr._expand = ["ff", "gg", "hh"]
     mgr._score = {}
-    #: empty, so these checks never touch the disk
+    #: empty,
     mgr._by_country = {}
     mgr._limited = {}
     mgr._used = {}
+    #: nothing verified
+    mgr._verified = {}
     #: no disk
     mgr._write_json = lambda *a: None
-    #: __init__ state the harness has to fake: nothing listens, nothing stops
+    #: __init__ state
     mgr._emit = lambda e: None
     mgr._stopping = False
     mgr._rebuilds = []
-    #: built with __new__, so it has no lanes dir and no stray tors
+    #: one move per lane
+    mgr._move_locks = {}
+    mgr._move_locks_lock = threading.Lock()
+    #: built
     mgr._clear_lane_dir_owner = lambda l: False
     return mgr
 
@@ -71,7 +77,7 @@ check("expansion reached after the fallback pool", picks[5:8] == ["ff", "gg", "h
 check("eight fresh countries, zero repeats", len(set(picks)) == 8)
 
 print("\n=== C. an exhausted walk starts over instead of giving up ===")
-# The old design persisted a country blacklist in
+# old design
 mgr = build()
 lane = mgr.lanes[0]
 picks = [mgr.rotate_exit_country(lane) for _ in range(10)]
@@ -105,7 +111,7 @@ mgr.note_result("", 200)
 check("no phantom score entries", mgr._score == {}, f"score={mgr._score}")
 
 print("\n=== E2. only the exit's own signals score ===")
-# A 403 is the free tier gating on
+# 403
 mgr = build()
 mgr.note_result("aa", 403)
 mgr.note_result("aa", 500)
@@ -135,7 +141,7 @@ def live_mgr(scores):
 
 
 print("\n=== G. a losing country is picked last, not never ===")
-# Live proof this guards: one 25-call lane ran
+# Live proof
 mgr = live_mgr({"aa": -3, "bb": 3})
 relay = Relay(mgr)
 picks = [relay.pick_lane().exit_country for _ in range(4)]
@@ -157,7 +163,7 @@ check("falls back to the losing lane instead of stalling",
       f"pick={getattr(pick, 'exit_country', None)}")
 
 print("\n=== H2. a burst diverges evenly across the whole pool ===")
-# The pool is a load balancer, not a
+# pool
 mgr = live_mgr({})
 relay = Relay(mgr)
 counts = {l.index: 0 for l in mgr.lanes}
@@ -179,7 +185,7 @@ check("a single failure outranks a losing record",
       pick.exit_country == "aa", f"pick={pick.exit_country}")
 
 print("\n=== J. a thin pool spreads instead of playing favourites ===")
-# Below _LOSING_MIN_POOL the losing rule is off on
+# Below _LOSING_MIN_POOL
 mgr = build()
 for l in mgr.lanes[:3]:
     l.healthy = True
@@ -192,7 +198,7 @@ check("a thin pool still uses the losing lane", "aa" in picks,
       f"picks={picks}")
 
 print("\n=== K. an exit the far end limited is picked last ===")
-# Live proof the rule exists: identical probes through
+# Live proof
 mgr = live_mgr({})
 relay = Relay(mgr)
 mgr.lanes[0].limited_until = time.time() + 12000
@@ -202,13 +208,10 @@ check("a limited lane is not picked while others are free",
 
 mgr.lanes[0].limited_until = 0.0
 picks = [relay.pick_lane().index for _ in range(3)]
-check("and it returns once its deadline passes", 1 in picks,
-      f"picks={picks}")
+check("and it returns once its deadline passes", 1 in picks, f"picks={picks}")
 
 print("\n=== K2. a warm circuit is picked before a cold one ===")
-# A lane that just booted or rotated listens on its SOCKS port before its
-# first probe, so it is healthy but its circuit is unbuilt. Preferring the
-# asked lane keeps the first call off that cold three-hop build.
+# lane
 mgr = live_mgr({})
 relay = Relay(mgr)
 for l in mgr.lanes:
@@ -233,7 +236,7 @@ check("a fully limited pool still hands out a lane", pick is not None,
       str(pick))
 
 print("\n=== M. every lane gets its own pinned exit ===")
-# Live proof the pin holds: ExitNodes $FP +
+# Live proof
 LANES = DATA_DIR / "lanes"
 GEO = DATA_DIR / "geoip"
 
@@ -262,12 +265,17 @@ if loaded:
           cfg.get("ExitNodes") == "$" + mgr.lanes[0].exit_fingerprint
           and cfg.get("StrictNodes") == "1", str(cfg.get("ExitNodes")))
 
-    ranges = exits.load_geoip(GEO)
-    wrong = [f"{l.exit_country}->{exits.country_of(ranges, l.exit_ip)}"
-             for l in mgr.lanes
-             if exits.country_of(ranges, l.exit_ip) != l.exit_country.upper()]
-    check("every pinned exit is in its lane's own country", not wrong,
-          str(wrong))
+    if GEO.exists():
+        ranges = exits.load_geoip(GEO)
+        wrong = [f"{l.exit_country}->{exits.country_of(ranges, l.exit_ip)}"
+                 for l in mgr.lanes
+                 if exits.country_of(ranges, l.exit_ip) != l.exit_country.upper()]
+        check("every pinned exit is in its lane's own country", not wrong,
+              str(wrong))
+    else:
+        # fresh install:
+        print("  [SKIP] every pinned exit is in its lane's own country -- "
+              "no geoip yet, lingling downloads it on the first run")
 
     print("\n=== N. a relay the far end limited is retired, not re-handed ===")
     victim = mgr.lanes[0]
@@ -292,13 +300,13 @@ if loaded:
           f"{len(set(fps2))} distinct")
 
     print("\n=== P. an exhausted country degrades to country-only ===")
-    mgr3 = pinned_mgr(countries=("hk",) * 6)      # 7 exits, ask for 6
+    mgr3 = pinned_mgr(countries=("hk",) * 6)  # 7 exits
     mgr3._load_exits()
     for l in mgr3.lanes:
         mgr3._pin(l)
     hk = len([l for l in mgr3.lanes if l.exit_fingerprint])
     check("it pins as many as it can", hk > 0, f"{hk}/6")
-    # retire every HK relay there is, not just
+    # retire every
     for exit_ in (mgr3._by_country or {}).get("HK", []):
         mgr3._limited[exit_.fingerprint] = time.time() + 12000
     mgr3._pin(mgr3.lanes[0])
@@ -312,7 +320,7 @@ else:
     check("relay list unavailable -- pinning degrades to country only", True)
 
 print("\n=== Q. countries.txt parsing ===")
-# A comment line must vanish rather than count
+# comment line
 sample = """# a comment line
 de,nl  # trailing note
 # fallback next
@@ -340,7 +348,7 @@ check("a real blank line still skips a pool",
       f"{primary} / {fallback} / {preferred}")
 
 print("\n=== R. limited exits survive a restart ===")
-# A retry-after runs to hours while a session
+# retry-after runs
 LIMITED = "AA" * 20
 EXPIRED = "BB" * 20
 with tempfile.TemporaryDirectory() as tmp:
@@ -348,7 +356,7 @@ with tempfile.TemporaryDirectory() as tmp:
     first = TorManager(root, count=1, exit_countries=["de"],
                        log=lambda *a: None)
     lane = first.lanes[0]
-    # Windows-excluded ranges swallow whole blocks. The defaults (socks
+    # Windows-excluded ranges
     check("the lane's ports are bindable",
           netutil.bindable(lane.socks_port)
           and netutil.bindable(lane.control_port),
@@ -356,13 +364,13 @@ with tempfile.TemporaryDirectory() as tmp:
     lane.exit_fingerprint = LIMITED
     lane.limited_until = time.time() + 12000
     first.note_limited(lane)
-    check("the limit is written down",
-          (root / LIMITED_PATH).is_file())
+    check("the limit is written down", (root / LIMITED_PATH).is_file())
 
     second = TorManager(root, count=1, exit_countries=["de"],
                         log=lambda *a: None)
+    remembered = second._limited.get(LIMITED) or {}
     check("a new manager remembers it",
-          second._limited.get(LIMITED, 0) > time.time(), str(second._limited))
+          remembered.get("until", 0) > time.time(), str(second._limited))
 
     (root / LIMITED_PATH).write_text(
         json.dumps({EXPIRED: time.time() - 1}), encoding="utf-8")
@@ -371,15 +379,14 @@ with tempfile.TemporaryDirectory() as tmp:
     check("an expired limit is forgotten", EXPIRED not in third._limited,
           str(third._limited))
 
-    (root / LIMITED_PATH).write_text("not json at all",
-                                           encoding="utf-8")
+    (root / LIMITED_PATH).write_text("not json at all", encoding="utf-8")
     fourth = TorManager(root, count=1, exit_countries=["de"],
                         log=lambda *a: None)
     check("a corrupt file never breaks startup", fourth._limited == {},
           str(fourth._limited))
 
 print("\n=== S. restarting a limited lane re-pins it ===")
-# The pin lives in the torrc, so a
+# pin lives
 mgr5 = build()
 mgr5._by_country = {}
 mgr5._limited = {}
@@ -387,36 +394,34 @@ mgr5._stopping = False
 mgr5._stop_lane_process = lambda l: None
 mgr5._write_torrc = lambda l: None
 mgr5._launch_lane = lambda l: "started"
-mgr5._write_json = lambda *a: None   # persistence is section R's job
+mgr5._write_json = lambda *a: None  # persistence
 pinned = {"n": 0}
 mgr5._pin = lambda l: pinned.__setitem__("n", pinned["n"] + 1)
 victim5 = mgr5.lanes[0]
 victim5.exit_fingerprint = "C" * 40
-victim5.socks_port = 59901        # unused, so no live process is ever probed
+victim5.socks_port = 59901  # unused,
 victim5.control_port = 59902
 victim5.limited_until = 0.0
-mgr5.note_limited(victim5, 9518)      # what the transport does on a 429
+mgr5.note_limited(victim5, 9518)  # what
 mgr5.restart_lane(victim5)
 check("a limited lane is re-pinned on restart", pinned["n"] == 1,
       f"pins={pinned['n']}")
+out_until = (mgr5._limited.get("C" * 40) or {}).get("until", 0)
 check("its old relay is out until the named reset",
-      mgr5._limited.get("C" * 40, 0) > time.time(), str(mgr5._limited))
+      out_until > time.time(), str(mgr5._limited))
 
 pinned["n"] = 0
 fresh = mgr5.lanes[1]
 fresh.exit_fingerprint = "D" * 40
 fresh.socks_port = 59903
 fresh.control_port = 59904
-fresh.limited_until = 0.0         # not limited: a plain dead-lane restart
+fresh.limited_until = 0.0  # not limited
 mgr5.restart_lane(fresh)
 check("a lane that is merely dead is NOT re-pinned", pinned["n"] == 0,
       f"pins={pinned['n']}")
 
 print("\n=== T. a lane with a live request is not torn down mid-flight ===")
-# Tearing a lane down while it is carrying work kills the answers its
-# users are waiting on -- thirty of them at once, on a night the pool was
-# busy. The move is handed to a watcher instead: the caller is never
-# blocked, and the tor is not stopped until the lane has nothing on it.
+# Tearing
 mgr6 = build()
 mgr6._by_country = {}
 mgr6._limited = {}
@@ -460,7 +465,7 @@ check("an idle lane restarts at once",
       f"idle={idle:.2f}s stopped={stopped}")
 
 print("\n=== U. a fully limited pool stops retrying instead of amplifying ===")
-# Live: 3.5 attempts per request with 71% of
+# Live: 3.5
 mgr7 = build()
 relay7 = Relay(mgr7)
 for l in mgr7.lanes:
@@ -470,13 +475,12 @@ check("excluding every lane leaves none",
       not relay7.any_unlimited({1, 2, 3, 4, 5, 6}))
 for l in mgr7.lanes:
     l.limited_until = time.time() + 12000
-check("a fully limited pool has nothing left",
-      not relay7.any_unlimited(set()))
+check("a fully limited pool has nothing left", not relay7.any_unlimited(set()))
 mgr7.lanes[2].limited_until = 0.0
 check("one unlimited lane is enough", relay7.any_unlimited(set()))
 
 print("\n=== V. a lane already carrying traffic is still used ===")
-# There is no concurrency cap. A healthy lane
+# no concurrency
 mgr8 = live_mgr({})
 for l in mgr8.lanes:
     l.active = 5
@@ -494,7 +498,7 @@ mgr9.lanes[3].active = 0
 check("the least loaded lane wins", Relay(mgr9).pick_lane().index == 4)
 
 print("\n=== W. every exit handed out is fresh and distinct ===")
-# A lane must not get the same top-bandwidth
+# lane must
 small = exits.Exit("A" * 40, "10.0.0.1", "small", 1)
 big = exits.Exit("B" * 40, "10.0.0.2", "big", 999)
 pool = {"DE": [big, small]}

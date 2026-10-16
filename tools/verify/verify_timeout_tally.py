@@ -46,7 +46,7 @@ def _hold(c):
         c.recv(64)
         c.sendall(bytes([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]))
         c.recv(65536)
-        c.sendall(b"H")  # spoke, then died
+        c.sendall(b"H")  # spoke,
         time.sleep(120)
     except OSError:
         pass
@@ -171,7 +171,7 @@ def main():
     ready.wait(5)
     up_port = holder[0]
 
-    # the transport points at lane.socks_port, so make the
+    # transport points
     real_socks = netutil.socks5_open
     real_ctx = ssl.create_default_context
     real_ceiling = mitm._READ_TIMEOUT
@@ -213,16 +213,26 @@ def main():
             self.index = i
             self.exit_country = "de"
             self.exit_ip = "1.2.3.4"
+            self.exit_fingerprint = f"{i:040X}"
             self.socks_port = up_port
             self.lock = threading.Lock()
             self.active = 0
+            self.streams = {}
+
+        def track_stream(self, sock, progress, hangup=None) -> None:
+            with self.lock:
+                self.streams[id(sock)] = (sock, progress, hangup)
+
+        def drop_stream(self, sock) -> None:
+            with self.lock:
+                self.streams.pop(id(sock), None)
 
     class Relay:
         def __init__(self):
             self.tor = Tor()
             self.tunnels = None
 
-        def report_refused(self, lane, status):
+        def report_refused(self, lane, status, fingerprint=""):
             return None
 
         def any_unlimited(self, tried):
@@ -273,7 +283,7 @@ def main():
     mute_port = holder2[0]
     charged_mute = []
     try:
-        # BOTH windows, and this block needs them set
+        # BOTH windows
         mitm._READ_TIMEOUT = 1.5
         mitm._FIRST_BYTE_TIMEOUT = 5.0
         relay = Relay()
@@ -306,7 +316,7 @@ def main():
     stall_port = holder3[0]
     charged_dial = []
     try:
-        # One short window, so the stalled greeting is a SOCKS timeout.
+        # One short
         mitm._FIRST_BYTE_TIMEOUT = 0.5
         relay = Relay()
         relay.tor.charged = charged_dial
@@ -331,8 +341,7 @@ def main():
           f"charged={charged_dial} -- an uncharged dial leaves lane 2 stuck")
 
     print("\n=== a refused dial is NOT charged, so a cold start survives ===")
-    # A lane whose port is closed is down, not limited; the health daemon
-    # owns that, so the tally must stay clear.
+    # lane whose
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.bind(("127.0.0.1", 0))
     dead_port = probe.getsockname()[1]
@@ -359,9 +368,7 @@ def main():
           f"charged={charged_refused} -- only a timeout means a dead exit")
 
     print("\n=== an SSL cut mid-read is charged, like a timeout ===")
-    # A tor exit that drops the TLS stream dies with SSLEOFError. The
-    # owner's rule: the very first cut takes the timeout verdict -- write
-    # the exit off, move the country, re-cook the lane.
+    # tor exit
 
     class CutFile:
         """A read that dies with SSLEOFError, mid-head."""
@@ -428,9 +435,7 @@ def main():
           "no lane event -- the move stayed silent")
 
     print("\n=== a first event over 20s is charged, like a timeout ===")
-    # The owner's rule: a lane whose first event takes longer than 20s
-    # gets the timeout verdict -- dropped and re-cooked in a new country
-    # -- even though the answer eventually arrives.
+    # owner's rule
 
     class PlainCtx:
         """The fake upstream speaks cleartext; skip the TLS wrap."""

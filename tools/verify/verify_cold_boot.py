@@ -182,8 +182,7 @@ def main():
     got = TorManager.cache_mtime(M(), ln2)
     check("a present cache file is reported", got > 0.0, f"got={got}")
     (ln2.data_dir / "cached-microdescs.new").write_bytes(b"y" * 10)
-    check("the newest file wins",
-          TorManager.cache_mtime(M(), ln2) >= got)
+    check("the newest file wins", TorManager.cache_mtime(M(), ln2) >= got)
 
     print("\n=== a MOVING cache is progress: the gate holds its fire ===")
     moves = itertools.count(start=2)
@@ -244,10 +243,7 @@ def main():
           tor.calls == [], f"calls={tor.calls}")
 
     print("\n=== the screen never freezes while tor works: probe is last ===")
-    # The old gate probed FIRST, and the probe blocks ~15s against a
-    # half-booted tor -- so a lane that reached 100% in 18s sat behind a
-    # frozen 'tor 0%' for 17 more seconds and was Ctrl+C'd as a hang.
-    # The gate must read progress EVERY sweep and probe only at 100%.
+    # old gate
     tor = FakeTor(1_000_000.0, boot_pct=0, pct_at=1_000_000.0 + 18)
     daemon = FakeDaemon(good_at=1_000_000.0 + 20)
     loader = FakeLoader()
@@ -274,10 +270,7 @@ def main():
         daemon.clock = clock
         cli._boot_gate(tor, ln7, daemon, deadline_s=600)
     print(f"  calls={tor.calls}")
-    # A bootstrapped lane with a dead exit should NOT be restarted -- a
-    # restart returns to the same exit. Rotation is the first poke: a
-    # fresh relay in a fresh country beats ExitNodes *, which strips the
-    # lane's country forever.
+    # bootstrapped lane
     check("the escalation ladder still fires at 100%",
           len(tor.calls) == 6 and tor.calls[0] == "rotate"
           and "regen" not in tor.calls and "unpin" not in tor.calls,

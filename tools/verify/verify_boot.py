@@ -6,21 +6,17 @@ import sys
 import sysconfig
 import time
 
-#: the console script's own copy, resolved per machine
+#: console script's
 sys.path.insert(0, sysconfig.get_paths()["purelib"])
 
 from lingling import netutil  # noqa: E402
+from lingling.bench import USED_PATH  # noqa: E402
 from lingling.cli import DATA_DIR, load_countries  # noqa: E402
-from lingling.lanes import USED_PATH, TorManager  # noqa: E402
+from lingling.lanes import TorManager  # noqa: E402
 
 
 def live_session() -> bool:
-    """True when a lingling or opencode process is already running.
-
-    This suite boots lanes on the real data dir, and a boot reaps the
-    orphan tor processes holding lane ports. Against a live session that
-    is not a reap, it is a kill -- so refuse rather than steal the ports.
-    """
+    """True when a lingling or opencode process is already running"""
     import subprocess
     try:
         out = subprocess.check_output(["tasklist"], text=True, timeout=15)

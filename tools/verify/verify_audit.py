@@ -1,6 +1,7 @@
 """Repo hygiene: does the tree still meet every standard we set?"""
 import ast
 import io
+import os
 import pathlib
 import re
 import subprocess
@@ -14,7 +15,7 @@ PKG = sorted((ROOT / "lingling").glob("*.py"))
 TOOLS = sorted((ROOT / "tools").rglob("*.py"))
 ALL_PY = PKG + TOOLS
 
-#: every file the tree is allowed to contain, and why
+#: every file
 EXPECTED = {
     ".gitignore": "excludes local state from git",
     "LICENSE": "licence",
@@ -24,7 +25,7 @@ EXPECTED = {
 }
 EXPECTED_DIRS = {"lingling": "the package", "tools": "dev tooling"}
 
-#: vocabulary that no longer describes anything in this codebase
+#: vocabulary
 STALE = ("identity", "walled", "burned_cycles", "report_burn", "_heal_burn",
          "avoid_countries", "_IDLE_GUARD", "spent-exits")
 
@@ -42,6 +43,14 @@ def check(name, cond, detail=""):
 
 def blob(files):
     return "\n".join(p.read_text(encoding="utf-8") for p in files)
+
+
+def _git_ignored(entry: pathlib.Path) -> bool:
+    """True when git itself already excludes this root entry."""
+    name = entry.name + ("/" if entry.is_dir() else "")
+    return subprocess.run(
+        ["git", "-C", str(ROOT), "check-ignore", "-q", "--", name],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
 
 def main():
@@ -84,7 +93,7 @@ def main():
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
                                  ast.ClassDef)):
                 defs.setdefault(node.name, []).append(p.name)
-    #: Walked, not just module level -- the old check read `ast.parse(...).body`,
+    #: Walked, not
     pkg_only = blob(PKG)
     dead = []
     for name in sorted(defs):
@@ -110,7 +119,7 @@ def main():
 
     print("\n=== the limit decision is single-sourced ===")
     pkg_src = blob(PKG)
-    #: the invariant, not a count: the recorder sets it, and the one path that
+    #: invariant, not
     owners = set()
     for p in PKG:
         lines = p.read_text(encoding="utf-8").splitlines()
@@ -121,12 +130,15 @@ def main():
                 fn = m.group(1)
             if "limited_until = " in ln:
                 owners.add(fn)
-    check("only the recorder and the re-pinner touch the deadline",
-          owners == {"note_limited", "restart_lane"}, str(sorted(owners)))
+    #: one recorder sets the deadline, and one clearer drops it -- a lane is
+    #: limited only while it still rides the exit that was written off, so the
+    #: only other writer is the call that hands it a different relay.
+    check("only the recorder and the exit change touch the deadline",
+          owners == {"note_limited", "forget_limit"}, str(sorted(owners)))
     check("one recorder owns it", pkg_src.count("def note_limited") == 1)
 
     print("\n=== a loaded lane is never benched ===")
-    # A lane that is healthy carries its request
+    # lane
     tree = ast.parse(pkg_src)
     for parent in ast.walk(tree):
         for child in ast.iter_child_nodes(parent):
@@ -135,22 +147,22 @@ def main():
              if isinstance(n, ast.FunctionDef) and n.name == "pick_lane"]
     check("pick_lane appears once", len(picks) == 1, f"{len(picks)} found")
     fn = picks[0] if picks else None
-    #: only statements that directly belong to pick_lane, not to a nested def
+    #: only statements
     own = [n for n in (fn.body if fn else []) if not isinstance(n, ast.FunctionDef)]
     own_src = "\n".join(ast.unparse(n) for n in own)
 
-    # `l.active` is how we *rank*. The rejected designs
+    # `l.active`
     def judges(node):
         up = getattr(node, "parent", None)
         while up is not None:
             if isinstance(up, (ast.Lambda, ast.IfExp)):
                 return True
             if isinstance(up, ast.comprehension):
-                return bool(up.ifs)      # a filter, not a bare iteration
+                return bool(up.ifs)  # filter, not
             if isinstance(up, ast.If):
                 return True
             if isinstance(up, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                return False             # the nested `key()` -- ranking
+                return False  # nested `key()`
             up = getattr(up, "parent", None)
         return False
 
@@ -160,11 +172,11 @@ def main():
             load_verdicts.append(ast.unparse(n.parent))
     check("pick_lane only ranks lanes by load, never judges them",
           not load_verdicts, " | ".join(load_verdicts[:3]))
-    #: a cap is a number compared against load; `capacity` is a word
+    #: cap
     check("pick_lane does not cap concurrency",
           not re.search(r"(max_active|_LANE_CAP|_CAP\b|>= *cap|busy *at *)",
                         own_src), "a cap is back")
-    #: the verdict, not the prose about it. A docstring may explain that the
+    #: verdict, not
     prose = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
@@ -185,31 +197,24 @@ def main():
           "holding this request" not in own_src)
 
     print("\n=== a timeout is a verdict now, the 429 action on the first hit ===")
-    # A timeout is a dead exit, so it takes the same
+    # timeout
     lsrc = (ROOT / "lingling" / "lanes.py").read_text(encoding="utf-8")
     lfns = {n.name: n for n in ast.walk(ast.parse(lsrc))
             if isinstance(n, ast.FunctionDef)}
     nt_src = ast.unparse(lfns["note_timeout"]) if "note_timeout" in lfns else ""
     check("note_timeout exists", "note_timeout" in lfns)
-    #: the same action a 429 takes: write it off, move the country, re-cook
-    check("a timeout writes the exit off",
-          "note_limited" in nt_src)
-    check("a timeout moves the country",
-          "rotate_exit_country" in nt_src)
-    check("a timeout re-cooks the lane",
-          "_rebuild_async" in nt_src)
-    #: the old strike layer is gone, not merely bypassed
+    #: same action
+    check("a timeout writes the exit off", "note_limited" in nt_src)
+    check("a timeout moves the country", "rotate_exit_country" in nt_src)
+    check("a timeout re-cooks the lane", "_rebuild_async" in nt_src)
+    #: old strike
     check("no strike counter is left anywhere",
           "timeout_run" not in lsrc and "repins" not in lsrc
           and "_TIMEOUT_RUN" not in lsrc,
           f"timeout_run={lsrc.count('timeout_run')} "
           f"repins={lsrc.count('repins')} "
           f"_TIMEOUT_RUN={lsrc.count('_TIMEOUT_RUN')}")
-    #: only a TimeoutError may charge the timeout tally, only an SSLError
-    #: the SSL verdict, and only the slow-exit ceiling the slow verdict -- a
-    #: strike on 403/503 stays forbidden. The SSL and slow gates are the
-    #: owner's rules: a TLS cut, and a first event over 20s, take the
-    #: timeout verdict at once.
+    #: only
     msrc = (ROOT / "lingling" / "mitm.py").read_text(encoding="utf-8")
     want = {"_note_timeout": "TimeoutError", "_note_ssl": "SSLError",
             "_note_slow": "_SLOW_EXIT_S"}
@@ -234,7 +239,7 @@ def main():
           "ungated _note_slow call")
 
     print("\n=== ctypes structs match the Windows ABI ===")
-    # A field declared one width too wide makes
+    # field declared
     import ctypes
     from lingling import winjob
     basic = ctypes.sizeof(winjob._JOBOBJECT_BASIC_LIMIT_INFORMATION)
@@ -250,7 +255,7 @@ def main():
     for word in STALE:
         for p in ALL_PY:
             if p.name == "verify_audit.py":
-                continue          # this list is the check itself
+                continue  # list
 
             for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
                 if word in line and "previous design" not in line \
@@ -262,8 +267,8 @@ def main():
     unknown = []
     for entry in sorted(ROOT.iterdir()):
         if entry.name.startswith("."):
-            allowed = set(EXPECTED) | {".git", ".workbuddy-ai", ".freebuff"}
-            if entry.name not in allowed:
+            allowed = set(EXPECTED) | {".git"}
+            if entry.name not in allowed and not _git_ignored(entry):
                 unknown.append(entry.name)
             continue
         if entry.name == "__pycache__":
@@ -280,10 +285,10 @@ def main():
 
     print("\n=== git will not carry local state ===")
     ignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
-    for pattern in (".workbuddy-ai/", "__pycache__/", "*.pyc", "*.egg-info/",
-                    "data/", ".env", ".venv/"):
+    for pattern in ("__pycache__/", "*.pyc", "*.egg-info/", "data/", ".env",
+                    ".env.*", ".venv/"):
         check(f".gitignore excludes {pattern}", pattern in ignore)
-    #: bytecode regenerates whenever anything runs, so the guarantee is that
+    #: bytecode regenerates
     present = len(list(ROOT.rglob("*.pyc")))
     check("bytecode is ignored, not tracked", "*.pyc" in ignore,
           f"{present} on disk")
@@ -301,9 +306,7 @@ def main():
         check("stem imports", False, repr(exc))
 
     print("\n=== the install points at this tree ===")
-    # The console script imports from site-packages, and this file prepends
-    # ROOT to sys.path -- so `lingling.__file__` here can only ever be ROOT,
-    # and the old check could never fail. Compare the installed copy instead.
+    # console script
     import json
     import importlib.metadata as meta
     try:
@@ -317,8 +320,7 @@ def main():
         check("the package is installed, not merely present", False,
               "no lingling distribution -- the console script cannot run")
     elif url.get("dir_info", {}).get("editable"):
-        # An editable install is this tree by construction, so it cannot
-        # be stale; there is no second copy to drift from.
+        # editable install
         check("the install is editable, so this tree is what runs", True,
               "no installed copy to drift")
     else:
@@ -336,9 +338,9 @@ def main():
                  if drifted else ""))
 
     print("\n=== the 20s ceiling is an idle ceiling, not a total budget ===")
-    # The one claim the owner asked to see
+    # one claim
     proof = ROOT / "tools" / "verify" / "verify_idle_ceiling.py"
-    # This one drives a 79s wall-clock schedule for
+    # one drives
     out = ""
     for _attempt in (1, 2):
         try:
@@ -361,7 +363,7 @@ def main():
               "[PASS] abandoned at the ceiling" in out
               and "[FAIL] abandoned at the ceiling" not in out,
               "the ceiling stopped biting")
-        # The ceiling splits at the moment of commit:
+        # ceiling splits
         check("a silence past the POST-commit ceiling is caught",
               "[PASS] the post-commit silence was caught" in out
               and "[FAIL] the post-commit silence was caught" not in out,
@@ -375,7 +377,7 @@ def main():
               out.strip().splitlines()[-1] if out.strip() else "no output")
 
     print("\n=== the per-lane timeout tally can see a timeout ===")
-    # Charged in the caller's retry loop, the tally
+    # Charged
     tally = ROOT / "tools" / "verify" / "verify_timeout_tally.py"
     try:
         res = subprocess.run([sys.executable, str(tally)], cwd=str(ROOT),
@@ -400,7 +402,7 @@ def main():
         check("timeout tally proof completes", False, "timed out")
 
     print("\n=== a late first token is not a timeout ===")
-    # A socket timeout is per blocking read, so
+    # socket timeout
     grace = ROOT / "tools" / "verify" / "verify_first_token_grace.py"
     try:
         res = subprocess.run([sys.executable, str(grace)], cwd=str(ROOT),
@@ -420,17 +422,37 @@ def main():
     except subprocess.TimeoutExpired:
         check("first token grace proof completes", False, "timed out")
 
-    print("\n=== a 429's retry-after is a window reset, not an exit cooldown ===")
-    # 72 of the log's 87 429s carry a
+    print("\n=== the notepad benches for the wall that was hit ===")
+    # 72
     lim = ROOT / "tools" / "verify" / "verify_limited_window.py"
     try:
         res = subprocess.run([sys.executable, str(lim)], cwd=str(ROOT),
                              capture_output=True, text=True, timeout=120)
         out = res.stdout + res.stderr
-        check("a window reset does not retire the exit",
-              "[PASS] a window reset does not become the exit's deadline" in out
-              and "[FAIL] a window reset does not become" not in out,
-              "a healthy exit was retired for hours")
+        check("the wall's own reset becomes the bench",
+              "[PASS] the wall's own reset becomes the deadline" in out
+              and "[FAIL] the wall's own reset becomes" not in out,
+              "the wall's reset is not honoured")
+        check("a headerless wall benches to the next 00:00 UTC",
+              "[PASS] a headerless wall benches to the next 00:00 UTC" in out
+              and "[FAIL] a headerless wall benches" not in out,
+              "no default reset for a headerless wall")
+        check("a nonsense reset cannot retire an exit forever",
+              "[PASS] the claim is clipped to the ceiling" in out
+              and "[FAIL] the claim is clipped" not in out, "no ceiling")
+        check("the burst limit has its own bounded stand-off",
+              "[PASS] no header means the stand-off" in out
+              and "[PASS] a long header cannot outlast the stand-off" in out
+              and "[FAIL] a long header cannot outlast" not in out,
+              "the burst window is unbounded")
+        check("the notepad keeps the two sections apart",
+              "[PASS] a free exit and a rate exit are told apart" in out
+              and "[FAIL] a free exit and a rate exit" not in out,
+              "the two limits were mixed up")
+        check("their edge is shown, and owns no exit",
+              "[PASS] their edge is loud, and owns no exit" in out
+              and "[FAIL] their edge is loud" not in out,
+              "opencode's own edge was charged to an exit")
         check("every 429 names the same reset instant",
               ("[PASS] every 429 in a day resolves to one instant" in out
                or "[SKIP] every 429 in a day resolves to one instant" in out)
@@ -449,7 +471,7 @@ def main():
         check("limited window proof completes", False, "timed out")
 
     print("\n=== the probe's refusal reaches the handler ===")
-    # The two refusal RULES live in verify_limit_gates, which
+    # two refusal
     guard = ROOT / "tools" / "verify" / "verify_refusal_guard.py"
     try:
         res = subprocess.run([sys.executable, str(guard)], cwd=str(ROOT),
@@ -482,7 +504,7 @@ def main():
         check("the one-session lock holds", False, "the suite timed out")
 
     print("\n=== the cold-connect handshake spends one window, not two ===")
-    # socks5_open makes two blocking reads. A socket timeout
+    # socks5_open makes
     cold = ROOT / "tools" / "verify" / "verify_cold_connect.py"
     try:
         res = subprocess.run([sys.executable, str(cold)], cwd=str(ROOT),
@@ -504,7 +526,7 @@ def main():
         check("cold connect proof completes", False, "timed out")
 
     print("\n=== the health probe asks with a real model name ===")
-    # The model name is validated BEFORE the limit
+    # model name
     import json as _json
     try:
         from lingling.health import PROBE_MODEL, PROBE_PATH, _scan_body
@@ -515,7 +537,7 @@ def main():
           len(model) > 8 and "-" in model,
           f"PROBE_MODEL={model!r} is a placeholder, so every probe "
           f"would return 401")
-    # The model and the path are a PAIR:
+    # model
     check("the probe's model and path are a known-good pair",
           (PROBE_MODEL, PROBE_PATH) in (
               ("muse-spark-1.3-contributor-free", "/zen/v1/responses"),
@@ -524,13 +546,13 @@ def main():
           f"to answer a verdict -- it will get a 500")
 
     print("\n=== reachable() hands back the far end's status ===")
-    # Every other suite stubs `reachable` out, so its
+    # Every other
     try:
         src = (ROOT / "lingling" / "health.py").read_text(encoding="utf-8")
         check("the 429 branch compares the status, not just truthiness",
               "if code == 429:" in src,
               "a 403 would be treated as a refusal and move a healthy lane")
-        # The other half of the same bug, and
+        # other half
         check("only a verdict marks a lane asked, not any truthy code",
               "if code in PROBE_VERDICTS:" in src,
               "a 401 or 500 from the probe reads as a healthy lane, so that "
@@ -539,10 +561,10 @@ def main():
         check("health.py is readable", False, repr(exc))
 
     print("\n=== every callend carries the fields a reader groups by ===")
-    # A key written on only SOME emit paths
+    # key written
     try:
         tree = ast.parse((ROOT / "lingling" / "mitm.py").read_text("utf-8"))
-        # A key supplied through `**helper()` is invisible to
+        # key supplied
         raw, splats = {}, {}
         for node in ast.walk(tree):
             if not isinstance(node, ast.FunctionDef):
@@ -560,7 +582,7 @@ def main():
                         fn = getattr(v.func, "id", None)
                         if fn:
                             splats[node.name].add(fn)
-        #: helper -> every key it contributes, splats followed one level
+        #: helper ->
         helpers = {}
         for name in raw:
             keys = set(raw[name])
@@ -577,7 +599,7 @@ def main():
             if not node.args or not isinstance(node.args[0], ast.Dict):
                 continue
             d = node.args[0]
-            # "callend" is the VALUE of the "type" key,
+            # "callend"
             pairs = {k.value: v for k, v in zip(d.keys, d.values)
                      if isinstance(k, ast.Constant)}
             kind = pairs.get("type")
@@ -589,14 +611,14 @@ def main():
                 if k is None and isinstance(v, ast.Call):
                     keys |= helpers.get(getattr(v.func, "id", ""), set())
             emits.append((node.lineno, keys))
-        #: keys every callend must carry
+        #: keys every
         universal = ("type", "t", "n", "c", "lane", "cc", "status", "kb",
                      "secs", "err", "reused", "cut", "max_wait_s",
                      "client_wait_s", "send_s", "peer_close",
                      "first_byte_s", "first_event_s", "client_kb",
-                     "raced")
-        #: keys that mean something on only one outcome, by design.
-        specific = {"retry_after", "stalled", "note"}
+                     "exit", "ip", "raced")
+        #: keys
+        specific = {"retry_after", "stalled", "note", "limit"}
         gaps = [(ln, sorted(set(universal) - keys)) for ln, keys in emits
                 if set(universal) - keys]
         check("every callend carries the same keys",
@@ -610,8 +632,8 @@ def main():
         check("mitm.py is parseable", False, repr(exc))
 
     print("\n=== the remaining suites, so none can break silently ===")
-    # The audit used to invoke only SOME of
-    for suite in ("verify_limit_gates", "verify_country_expand",
+    # audit used
+    for suite in ("verify_bounds", "verify_limit_gates", "verify_country_expand",
                   "verify_call_outcome", "verify_probe_branch",
                   "verify_request_params", "verify_committed_stream",
                   "verify_client_stall", "verify_reused_send",
@@ -619,32 +641,31 @@ def main():
                   "verify_expect_header", "verify_short_body",
                   "verify_close_honoured", "verify_pool_ttl",
                   "verify_send_window", "verify_torrc",
-                  # a cold data dir must not turn the
+                  # cold data
                   "verify_cold_boot",
-                  # the 503/504 session: a retryable verdict must reach
+                  # 503/504 session
                   "verify_5xx_delivery",
-                  # floors the three windows that no suite was
+                  # a wall that catches the pool
+                  "verify_limit_retry",
+                  # floors
                   "verify_window_floors",
-                  # the owner's FIRST rule -- never invent a
+                  # owner's FIRST
                   "verify_no_lane_cap",
-                  # the lane election: a round names the quickest lane, and
-                  # the release ceiling and any verdict reopen it
+                  # owner's rule
+                  "verify_first_content_deadline",
+                  # committed one
+                  "verify_stall_cut",
+                  # lane election
                   "verify_sticky",
-                  # every call goes out on every lane at once: the first
-                  # answer takes the client, and the losers are cut silent
+                  # every call
                   "verify_lane_race",
-                  # the probe must warm the circuit the requests ride, not
-                  # its own -- a credential that drifts per request makes
-                  # Tor rebuild a circuit on every call
+                  # probe must
                   "verify_probe_circuit",
-                  # 2.0.26 opencode makes model calls in a background server
-                  # that keeps the env it was born with, so every request
-                  # left without a lane -- the server must be restarted under
-                  # our env, and stopped again on the way out
+                  # 2.0.26 opencode
                   "verify_server_proxy",
-                  # pip cannot clean the data dir -- it only knows the 18
-                  # files in site-packages -- so the uninstaller must,
-                  # and must never touch the hand-written countries file
+                  # the next race
+                  "verify_exit_sweep",
+                  # pip cannot
                   "verify_uninstall"):
         path = ROOT / "tools" / "verify" / f"{suite}.py"
         try:
@@ -660,22 +681,25 @@ def main():
             check(f"{suite} completes", False, "timed out")
 
     print("\n=== the post-commit window is generous enough ===")
-    # The window only ever measures SILENCE. A stream
+    # window only
+    env = {k: v for k, v in os.environ.items()
+           if k != "LINGLING_STREAM_IDLE_S"}
+    shipped = 0.0
     try:
-        src = (ROOT / "lingling" / "mitm.py").read_text("utf-8")
-        line = next((ln for ln in src.splitlines()
-                     if "LINGLING_STREAM_IDLE_S" in ln), "")
-        parts = line.split('"')
-        shipped = float(parts[3]) if len(parts) >= 4 else 0.0
-        check("the post-commit window is at least 600s",
-              shipped >= 600,
-              f"shipped default is {shipped}s -- a shorter window cannot help "
-              f"a stream that is emitting, it can only cut one that paused")
-    except (OSError, ValueError) as exc:  # noqa: BLE001
-        check("the post-commit window is at least 600s", False, repr(exc))
+        res = subprocess.run(
+            [sys.executable, "-c",
+             "import lingling.mitm as m; print(m._STREAM_IDLE_TIMEOUT)"],
+            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=60)
+        shipped = float(res.stdout.strip().splitlines()[-1])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        shipped = 0.0
+    check("the post-commit window is at least 600s",
+          shipped >= 600,
+          f"shipped default is {shipped}s -- a shorter window cannot help "
+          f"a stream that is emitting, it can only cut one that paused")
 
     print("\n=== the stall analyzer's join is session-aware ===")
-    # tools/soak/stall_by_effort.py correlates stalls with reasoning effort by
+    # tools/soak/stall_by_effort.py correlates
     tool = ROOT / "tools" / "soak" / "stall_by_effort.py"
     try:
         res = subprocess.run([sys.executable, str(tool), "--selftest"],

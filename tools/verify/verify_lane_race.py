@@ -1,4 +1,4 @@
-"""One call goes out on every lane: the first answer takes the client."""
+"""The race at the whole pool: claim, cut, one verdict, sticky."""
 import io
 import socket
 import ssl
@@ -48,6 +48,7 @@ class Lane:
         self.index = index
         self.exit_country = "de"
         self.exit_ip = f"1.2.3.{index}"
+        self.exit_fingerprint = f"{index:040X}"
         self.socks_port = 0
         self.healthy = True
         self.healing = False
@@ -59,6 +60,15 @@ class Lane:
         self.process = None
         self.lock = threading.Lock()
         self.active = 0
+        self.streams = {}
+
+    def track_stream(self, sock, progress, hangup=None) -> None:
+        with self.lock:
+            self.streams[id(sock)] = (sock, progress, None)
+
+    def drop_stream(self, sock) -> None:
+        with self.lock:
+            self.streams.pop(id(sock), None)
 
 
 class Tor:
@@ -76,7 +86,8 @@ class Tor:
     def healthy_lanes(self):
         return [l for l in self.lanes if l.healthy and not l.healing]
 
-    def note_limited(self, lane, retry_after=0.0):
+    def note_limited(self, lane, retry_after=0.0, reason="rate",
+                     fingerprint=""):
         lane.limited_until = time.time() + (retry_after or 600)
         self.moved.append(lane.index)
 
@@ -110,7 +121,7 @@ class Relay:
                 return lane
         return None
 
-    def report_refused(self, lane, status):
+    def report_refused(self, lane, status, fingerprint=""):
         self.refused.append((lane.index, status))
 
     def any_unlimited(self, exclude):
@@ -230,7 +241,7 @@ class Upstream:
             c.sendall(HEAD)
             c.sendall(chunk(marker))
             c.sendall(b"0\r\n\r\n")
-            # the hand that asked is gone if this reads empty
+            # hand
             c.settimeout(4.0)
             if c.recv(1) == b"":
                 self.closed += 1
@@ -338,9 +349,12 @@ def serve(specs, benched=()):
 
 
 def main():
+    """Mechanics at the whole pool first, then the shipped default."""
+    shipped_width = mitm._RACE_WIDTH
+    #: sections 1-12
+    mitm._RACE_WIDTH = 5
     print("=== 1. one call, every lane: the first answer takes the client ===")
-    # The owner's complaint: one request rode one lane and waited behind
-    # that lane's queue while the other four sat idle.
+    # owner's complaint
     specs = [("sse", 2.0, b"lane-1"), ("sse", 1.5, b"lane-2"),
              ("sse", 0.1, b"lane-3"), ("sse", 1.8, b"lane-4"),
              ("sse", 0.4, b"lane-5")]
@@ -442,9 +456,7 @@ def main():
           repr(bytes(client.got[:60])))
 
     print("\n=== 6. a dead heat still has exactly one winner ===")
-    # Two lanes can land on the same microsecond. The claim is decided
-    # under one lock, so the first copy in takes the client and every other
-    # copy is refused -- there is no window where two of them both answer.
+    # Two lanes
     lanes = [Lane(i + 1) for i in range(5)]
     copies = [mitm._Copy(lane) for lane in lanes]
     race = mitm._Race(copies)
@@ -495,9 +507,7 @@ def main():
           str([u.dials for u in ups]))
 
     print("\n=== 8. a winner with no record still owns the call ===")
-    # If that copy's own record is missing, the round must still count as
-    # answered -- otherwise the caller races the pool again and one request
-    # gets two answers.
+    # copy's own
     lane = Lane(1)
     copy = mitm._Copy(lane)
     race = mitm._Race([copy])
@@ -535,10 +545,7 @@ def main():
           out == ("", 0, b"", False), str(out))
 
     print("\n=== 10. a winner whose stream is cut still charges its own lane ===")
-    # The losers of a race are cut by us, so they can no longer charge
-    # anything: a copy that won and then had its stream cut is the only
-    # witness left for that exit. Left uncharged, a bad exit keeps winning
-    # races and keeps cutting streams -- measured live, 4% of calls.
+    # losers
     def drive(index: int, first: bool, served: bytes, join=None, client=None):
         """One copy of one race: `join` shares a race that has no winner."""
         if join is None:
@@ -594,9 +601,7 @@ def main():
           tor.ssl == [1], f"ssl={tor.ssl}")
 
     print("\n=== 11. a cold pool still charges exactly one lane ===")
-    # The gate the fix must not widen: five lanes dying of one dead pool is
-    # one verdict, not five -- with no winner, only the first copy speaks
-    # for the call.
+    # gate
     race = mitm._Race([mitm._Copy(Lane(i + 1)) for i in range(5)])
     tor = Tor([c.lane for c in race.copies])
     _out, tor, _race, _ends = drive(1, first=True, served=b"", join=(race, tor))
@@ -606,9 +611,7 @@ def main():
           tor.ssl == [1], f"ssl={tor.ssl}")
 
     print("\n=== 12. a client that goes away is not the exit's fault ===")
-    # The fix lets the copy that owns the client charge its lane, so this
-    # is the line it must not cross: a cut on the CLIENT side -- the caller
-    # closing on a living exit -- still retires nothing.
+    # fix lets
     served = HEAD + chunk(b"lane-2") + chunk(b"more")
     out, tor, _race, ends = drive(2, first=False, served=served,
                                   client=FailClient(fail_at=2))
@@ -621,6 +624,57 @@ def main():
           and ends[0].get("status") == 200
           and ends[0].get("client_kb", 0) > 0,
           str(ends[:1]))
+
+    print("\n=== 13. the shipped race covers the whole live pool ===")
+    # product's own
+    check("the shipped race is not narrowed", shipped_width == 0,
+          f"_RACE_WIDTH={shipped_width} -- 0 means every live lane")
+    specs = [("sse", 9.0, b"lane-slow"), ("sse", 9.0, b"lane-slow"),
+             ("sse", 0.2, b"lane-fast")]
+    client, events, tor, relay, ups = serve(specs)
+    calls = [e for e in events if e.get("type") == "call"]
+    raced = calls[0].get("lanes") if calls else []
+    dials = [u.dials for u in ups]
+    print(f"  raced={raced}  dials={dials}")
+    check("every live lane is in the wave", raced == [1, 2, 3], str(raced))
+    check("and every one of them was dialled", dials == [1, 1, 1], str(dials))
+    check("the quickest lane's answer is what the client got",
+          b"lane-fast" in client.got, repr(bytes(client.got[:60])))
+    check("with exactly one answer in its stream",
+          bytes(client.got).count(b"data: ") == 1,
+          repr(bytes(client.got[:120])))
+
+    print("\n=== 14. the knob narrows a wave, and a refused one still widens ===")
+    was = mitm._RACE_WIDTH
+    try:
+        mitm._RACE_WIDTH = 2
+        specs = [("429", 0.05, b""), ("429", 0.05, b""),
+                 ("sse", 0.2, b"lane-fast"), ("sse", 9.0, b"lane-slow")]
+        client, events, tor, relay, ups = serve(specs)
+    finally:
+        mitm._RACE_WIDTH = was
+    calls = [e for e in events if e.get("type") == "call"]
+    waves = [c.get("lanes") or [] for c in calls]
+    dials = [u.dials for u in ups]
+    print(f"  width=2  waves={waves}  dials={dials}")
+    check("no wave is wider than the knob",
+          bool(waves) and all(len(w) <= 2 for w in waves), str(waves))
+    check("no lane is raced twice across the waves",
+          len({i for w in waves for i in w}) == sum(len(w) for w in waves),
+          str(waves))
+    check("a refused wave is followed by the next lanes",
+          len(waves) >= 2, str(waves))
+    check("so the call reaches a lane the first wave never touched",
+          any(i > 2 for w in waves for i in w), str(waves))
+    check("and every lane was dialled at most once",
+          all(d <= 1 for d in dials), str(dials))
+    check("the refused lanes were moved off", sorted(tor.moved) == [1, 2],
+          str(tor.moved))
+    check("the client got the fresh lane's answer",
+          b"lane-fast" in client.got, repr(bytes(client.got[:60])))
+    check("with exactly one answer in its stream",
+          bytes(client.got).count(b"data: ") == 1,
+          repr(bytes(client.got[:120])))
 
     print()
     if FAILS:

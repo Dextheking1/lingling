@@ -93,7 +93,7 @@ class StalledClient:
         if self.got < self.budget:
             self.got += len(data)
             return
-        # the client has stopped reading: block like a
+        # client has
         t = time.monotonic()
         time.sleep(self.stall_for)
         waited = time.monotonic() - t
@@ -119,16 +119,26 @@ def run(port, client, upstream_sets_timeout=True):
 
     ssl.create_default_context = lambda *a, **k: RawCtx()
     mitm._STREAM_IDLE_TIMEOUT = 3.0
-    # BOTH windows, explicitly. This used to leave the
+    # BOTH windows
     mitm._READ_TIMEOUT = 3.0
 
     class Lane:
         index = 1
         exit_country = "de"
         exit_ip = "1.2.3.4"
+        exit_fingerprint = "F" * 40
         socks_port = port
         lock = threading.Lock()
         active = 0
+        streams = {}
+
+        def track_stream(self, sock, progress, hangup=None) -> None:
+            with self.lock:
+                self.streams[id(sock)] = (sock, progress, hangup)
+
+        def drop_stream(self, sock) -> None:
+            with self.lock:
+                self.streams.pop(id(sock), None)
 
     charged = []
 
@@ -158,7 +168,7 @@ def main():
     def case_streams_then_idles(c):
         socks_hello(c)
         c.sendall(HEAD)
-        # commit, then keep sending so the relay has
+        # commit,
         for _ in range(200):
             chunk(c, EVENT)
         c.sendall(b"0\r\n\r\n")
@@ -178,7 +188,7 @@ def main():
           (rec.get("client_wait_s") or 0) > (rec.get("max_wait_s") or 0),
           f"client_wait_s={rec.get('client_wait_s')} vs "
           f"max_wait_s={rec.get('max_wait_s')}")
-    # `client_kb` is what the CLIENT received, against `kb`
+    # `client_kb`
     check("client_kb records what the client actually received",
           abs((rec.get("client_kb") or -1) - client.got / 1024) < 1.0,
           f"client_kb={rec.get('client_kb')!r} against the client's own count "
@@ -186,7 +196,7 @@ def main():
     check("the LANE IS NOT CHARGED for the client's stall",
           charged == [],
           f"charged={charged} -- a healthy lane would be retired")
-    # The error path runs AFTER the head was
+    # error path
     check("the error path reports the status the head carried",
           rec.get("status") == 200,
           f"status={rec.get('status')!r} -- a delivered 200 counted as a miss")
@@ -195,7 +205,7 @@ def main():
 
     def case_upstream_mute(c):
         socks_hello(c)
-        # never send anything: the upstream is the one
+        # never send
         time.sleep(60)
 
     class FineClient:

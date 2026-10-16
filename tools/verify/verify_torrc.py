@@ -3,6 +3,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -64,8 +65,7 @@ def main():
         check("tor --verify-config runs", False, f"{type(exc).__name__}")
         return 1
 
-    bad = [ln for ln in out.splitlines()
-           if "[warn]" in ln or "[err]" in ln]
+    bad = [ln for ln in out.splitlines() if "[warn]" in ln or "[err]" in ln]
     check("tor accepts the whole file", not bad,
           bad[0] if bad else "Configuration was valid")
 
@@ -84,6 +84,35 @@ def main():
           "CircuitBuildTimeout" not in cfg)
     check("conflux is off by default (it was cutting streams)",
           cfg.get("ConfluxEnabled") == "0", f"ConfluxEnabled={cfg.get('ConfluxEnabled')}")
+
+    print("\n=== a lane's recook leaves the torrc naming its relay ===")
+    #: The refusal path re-pins a lane before the recook starts, so the recook
+    #: can find the pin already where it wants it and still have a torrc on disk
+    #: naming the relay the lane was just moved OFF.  tor then relaunched on the
+    #: spent exit while every request was charged to the fresh one, which is how
+    #: a whole pool of relays gets written off without one of them being asked.
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix="lingling-torrc-pin-"))
+    #: geoip present, so the lane is pinned to a relay and not to a country
+    (scratch / "tools" / "data").mkdir(parents=True, exist_ok=True)
+    (scratch / "tools" / "data" / "geoip").write_text("", encoding="utf-8")
+    m = TorManager(scratch, count=1, exit_countries=["de"],
+                   log=lambda *a: None)
+    lane = m.lanes[0]
+    lane.exit_fingerprint = "A" * 40
+    m._write_torrc(lane)
+    m._pin = lambda l: True          # the recook re-picks the same relay
+    m._stop_lane_process = lambda l: True
+    m._launch_lane = lambda l: "started"
+    before = lane.torrc_path().read_text(encoding="utf-8")
+    check("the torrc starts on the relay the lane reads",
+          "ExitNodes $" + "A" * 40 in before, before.splitlines()[-1:])
+    lane.exit_fingerprint = "B" * 40   # moved on, as a 429 moves a lane
+    lane.limited_until = time.time() + 600
+    check("the recook runs", m.restart_lane(lane) is True, "the recook refused")
+    after = lane.torrc_path().read_text(encoding="utf-8")
+    check("and tor is left on the relay the lane now reads",
+          "ExitNodes $" + "B" * 40 in after and "A" * 40 not in after,
+          after.splitlines()[-1:])
 
     print("\n" + "=" * 46)
     if FAILS:

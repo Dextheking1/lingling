@@ -100,9 +100,19 @@ def run(port, pre=2.0, post=8.0):
         index = 1
         exit_country = "de"
         exit_ip = "1.2.3.4"
+        exit_fingerprint = "F" * 40
         socks_port = port
         lock = threading.Lock()
         active = 0
+        streams = {}
+
+        def track_stream(self, sock, progress, hangup=None) -> None:
+            with self.lock:
+                self.streams[id(sock)] = (sock, progress, hangup)
+
+        def drop_stream(self, sock) -> None:
+            with self.lock:
+                self.streams.pop(id(sock), None)
 
     class Tap:
         """Stands in for the client socket; records what reached it."""
@@ -140,9 +150,9 @@ def run(port, pre=2.0, post=8.0):
 
 
 def main():
-    # Short windows so the proof runs in seconds;
+    # Short windows
     pre, post = 2.0, 8.0
-    gap = 5.0                      # > pre, < post -- the owner's shape
+    gap = 5.0  # > pre
 
     print("=== (A) committed, then pauses to think ===")
     print(f"  commit, then a {gap:.0f}s gap; pre-commit ceiling {pre}s, "
@@ -193,14 +203,14 @@ def main():
         c.sendall(HEAD)
         chunk(c, EVENT)
         time.sleep(0.3)
-        c.close()                  # real close, not silence
+        c.close()  # real close
 
     err, secs, sent, rec = run(start_upstream(case_closes), pre, post)
     print(f"  result: err={err!r} wall={secs:.1f}s status={rec.get('status')}")
     check("a closed peer is not mistaken for a stall",
           err != "TimeoutError" and secs < post,
           f"err={err!r} wall={secs:.1f}s -- EOF should end it at once")
-    # The head was a 200 and bytes reached
+    # head
     check("a truncated 200 is recorded as 200, not as a failure",
           rec.get("status") == 200,
           f"status={rec.get('status')!r} -- a delivered 200 counted as a miss")
@@ -213,7 +223,7 @@ def main():
         c.sendall(HEAD)
         chunk(c, EVENT)
         for _ in range(10):
-            time.sleep(1.0)        # each gap under post
+            time.sleep(1.0)  # each gap
             chunk(c, EVENT)
         c.sendall(b"0\r\n\r\n")
 

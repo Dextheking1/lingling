@@ -156,9 +156,7 @@ sys.stdin.read()
                 patch.object(netutil.subprocess, "run", side_effect=AssertionError("unsafe kill")), \
                 patch.object(manager, "_stop_orphan", return_value=False) as stop:
             self.assertEqual(manager._reap_orphans(), 0)
-            # 52001 is lane 1's SOCKS port, so 52301 is the control port the
-            # stray must be answering on. Offering it is what makes a tor
-            # whose torrc was rewritten reachable again.
+            # 52001
             stop.assert_called_once_with(123, [52301])
         config = manager.lanes[0].torrc_path()
         config.parent.mkdir(parents=True)
@@ -192,8 +190,7 @@ sys.stdin.read()
             lanes._leftover_ports(111, held, 52001, 52301), [52303])
         self.assertEqual(
             lanes._leftover_ports(222, held, 52001, 52301), [52309])
-        self.assertEqual(
-            lanes._leftover_ports(333, held, 52001, 52301), [])
+        self.assertEqual( lanes._leftover_ports(333, held, 52001, 52301), [])
 
     def test_abandoned_launch_leaves_no_tor_behind(self):
         """A tor that arrives after its boot window must be killed."""
@@ -218,7 +215,7 @@ sys.stdin.read()
                     return Proc()
 
         def late():
-            # still starting when the boot window closes
+            # still starting
             time.sleep(1.5)
             released.set()
 
@@ -268,7 +265,7 @@ sys.stdin.read()
                              side_effect=lambda *a, **k:
                              order.append("clear") or True) as stop:
             self.assertTrue(mgr.restart_lane(lane))
-        # stop -> clear the holder -> write the torrc -> launch
+        # stop ->
         self.assertEqual(order, ["stop", "clear", "torrc", "launch"], order)
         stop.assert_called_once()
         self.assertEqual(stop.call_args.args[0], 4242)
@@ -299,14 +296,7 @@ sys.stdin.read()
                 mgr._stop_orphan(77, [52301], only=mgr.lanes_dir / "tor-2"))
 
     def test_orphan_probe_survives_a_broken_auth(self):
-        """A probe that blows up means "not ours", never a crash.
-
-        stem 1.8.2 builds AuthChallengeFailed with a third argument its
-        constructor does not take, so an endpoint that fails mid-probe --
-        a SOCKS port dialled as a control port, a tor that just died --
-        arrives as a TypeError. That escaped this probe and killed the
-        request whose refusal triggered the relaunch.
-        """
+        # stem 1.8.2
         mgr = TorManager(self.root, count=1, exit_countries=["de"],
                          log=lambda *a: None)
         own = mgr.lanes_dir / "tor-1"
@@ -328,26 +318,12 @@ sys.stdin.read()
                 mgr._stop_orphan(55, [52301], only=own),
                 "a failed auth attempt was read as proven ownership")
             self.assertEqual(signals, [], "something was shut down anyway")
-            # the endpoint is asked the honest way, so a socket that fails
-            # arrives as the caught ControllerError and not as a TypeError
+            # endpoint
             self.assertIs(auth.call_args.kwargs.get("suppress_ctl_errors"),
                           False, str(auth.call_args))
 
     def test_a_dead_endpoint_cannot_arrive_as_a_typeError(self):
-        """The flag is not cosmetic: ask stem honestly, for real.
-
-        The test above stubs the auth call out, so it proves the flag we
-        pass and never what the library does with it. Here the endpoint is
-        a real socket that accepts and hangs up -- a SOCKS port dialled as
-        a control port, or a tor that just died -- and the ask is stem's
-        own code. The default path, which reports a failed socket as an
-        auth rejection, builds AuthChallengeFailed with a third argument
-        its constructor does not take, so it arrives as a TypeError. Asking
-        for the honest error keeps it a caught ControllerError: that is the
-        whole reason a probe like this can never reach the thread boundary
-        as a traceback. (If an upgrade fixes stem itself, the assertion
-        below still holds.)
-        """
+        """The flag is not cosmetic: ask stem honestly, for real"""
         import stem.connection
         import stem.control
 
@@ -369,7 +345,7 @@ sys.stdin.read()
 
         threading.Thread(target=hang_up, daemon=True).start()
         cookie = self.root / "control_auth_cookie"
-        cookie.write_bytes(os.urandom(32))      # a SAFECOOKIE is 32 bytes
+        cookie.write_bytes(os.urandom(32))  # SAFECOOKIE
 
         def ask(suppress):
             ctl = stem.control.Controller.from_port(port=port)

@@ -29,7 +29,7 @@ class FakeLane:
         self.asked = False
         self.probe_code = -1
         self.healthy = True
-        # asked to run
+        # asked
         self.wanted = True
         # not mid-launch
         self.healing = False
@@ -48,6 +48,10 @@ class FakeTor:
         self.notes = []
         self.rotated = []
 
+    def claim_move(self, lane):
+        """One burst on one lane is one move; one probe is asking here."""
+        return True
+
     def restart_lane(self, lane, repin=False):
         return False
 
@@ -58,7 +62,8 @@ class FakeTor:
     def note_result(self, country, code):
         self.notes.append((country, code))
 
-    def note_limited(self, lane, retry_after=0.0):
+    def note_limited(self, lane, retry_after=0.0, reason="rate",
+                     fingerprint=""):
         lane.limited_until = 1e12
 
     def healthy_lanes(self):
@@ -134,7 +139,7 @@ def main():
           f"exit_ip={tor.lanes[0].exit_ip!r}")
 
     print("\n=== a non-verdict is NOT a verdict about the lane ===")
-    # The rule used to be `if code:`, so
+    # rule used
     for status in (401, 500):
         events = []
         with daemon(status, events) as (tor, d):
@@ -160,9 +165,7 @@ def main():
           tor.lanes[0].asked is True, f"asked={tor.lanes[0].asked}")
 
     print("\n=== no lane can hide from the sweep for a whole session ===")
-    # A lane skipped by the sweep rode traffic with no verdict, no exit IP
-    # and no line in the pane. Every lane now carries every call, so one
-    # with no verdict has to keep being asked for one.
+    # lane skipped
     events = []
     with daemon(403, events) as (tor, d):
         d.check_once()
@@ -201,9 +204,9 @@ def main():
     calls = []
     real = health.HealthDaemon.on_refused
 
-    def spy(self, lane, status=429):
+    def spy(self, lane, status=429, fingerprint=""):
         calls.append(status)
-        return real(self, lane, status)
+        return real(self, lane, status, fingerprint)
 
     health.HealthDaemon.on_refused = spy
     try:

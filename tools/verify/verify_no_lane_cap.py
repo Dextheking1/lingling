@@ -16,7 +16,7 @@ def check(name, ok, detail=""):
         FAILS.append(name)
 
 
-#: unmistakably a concurrency limit, whatever it is set to
+#: unmistakably
 HARD_CAP = ("max_active", "maxactive", "quota", "lane_cap", "active_cap",
             "cap_limit")
 
@@ -54,7 +54,7 @@ def findings(src: str):
     out = []
     tree = ast.parse(src)
     for node in ast.walk(tree):
-        # module/function-level assignment to a cap-like name
+        # module/function-level assignment
         if isinstance(node, ast.Assign):
             for t in node.targets:
                 if not isinstance(t, ast.Name):
@@ -63,13 +63,13 @@ def findings(src: str):
                     out.append(f"cap-like constant `{t.id}`")
                 elif _soft_cap_name(t.id) and _numeric(node.value):
                     out.append(f"cap-like constant `{t.id}` (numeric)")
-        # a cap parameter on the picker
+        # cap parameter
         if isinstance(node, ast.FunctionDef) and node.name == "pick_lane":
             names = [a.arg for a in node.args.args]
             if any(_is_cap_name(n) for n in names):
                 out.append(f"pick_lane takes a cap parameter {names}")
             for n in ast.walk(node):
-                # `if l.active >= X` -- what a cap
+                # l.active >=
                 if isinstance(n, ast.Compare):
                     left = n.left
                     if isinstance(left, ast.Attribute) and left.attr == "active":

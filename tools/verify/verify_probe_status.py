@@ -18,7 +18,7 @@ PLACEHOLDER = (b'{"model":"x","stream":false,"max_output_tokens":1,'
                b'[{"type":"input_text","text":"x"}]}]}')
 BODY = _scan_body(PROBE_MODEL, PROBE_PATH)
 
-#: the (model, path) pairs measured to answer a verdict, and one that does not
+#: (model, path)
 GOOD_PAIRS = [
     ("muse-spark-1.3-contributor-free", "/zen/v1/responses"),
     ("mimo-v2.6-flash-free", "/zen/v1/chat/completions"),
@@ -44,12 +44,7 @@ def send(port, body, path=PROBE_PATH):
 
 
 def live_session() -> bool:
-    """True when a lingling or opencode process is already running.
-
-    The live half boots a lane on the real data dir, and a boot reaps the
-    orphan tor processes holding lane ports. Against a live session that
-    is not a reap, it is a kill.
-    """
+    """True when a lingling or opencode process is already running"""
     import subprocess
     try:
         out = subprocess.check_output(["tasklist"], text=True, timeout=15)
@@ -96,8 +91,11 @@ def main():
 
         code, text = send(lane.socks_port, PLACEHOLDER)
         print(f"\n  placeholder model -> {code}  {text!r}")
-        check("the placeholder reproduces the bug (so this test can catch it)",
-              code == 401, f"got {code}")
+        # no verdict
+        check("the placeholder is not a verdict (so this test can catch it)",
+              code not in health.PROBE_VERDICTS,
+              f"got {code} -- a bogus model answered a verdict, so this "
+              f"control no longer proves the detector bites")
 
         time.sleep(1.5)
         code2, text2 = send(lane.socks_port, BODY)
@@ -108,7 +106,7 @@ def main():
               code2 in (403, 429), f"got {code2}")
 
         print("\n=== live: the (model, path) pairs, so the override is safe ===")
-        # The model and the path are a PAIR.
+        # model
         for model, path in GOOD_PAIRS:
             time.sleep(1.5)
             code3, text3 = send(lane.socks_port, _scan_body(model, path), path)

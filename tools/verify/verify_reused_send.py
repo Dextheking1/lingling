@@ -37,7 +37,7 @@ class RecordingSock:
     def sendall(self, data):
         self.calls.append(("sendall", len(data)))
         if self.block_for:
-            time.sleep(self.block_for)   # a send that has to wait
+            time.sleep(self.block_for)  # send
             raise TimeoutError("timed out")
 
     def close(self):
@@ -70,9 +70,19 @@ def main():
         index = 1
         exit_country = "de"
         exit_ip = "1.2.3.4"
+        exit_fingerprint = "F" * 40
         socks_port = 0
         lock = threading.Lock()
         active = 0
+        streams = {}
+
+        def track_stream(self, sock, progress, hangup=None) -> None:
+            with self.lock:
+                self.streams[id(sock)] = (sock, progress, hangup)
+
+        def drop_stream(self, sock) -> None:
+            with self.lock:
+                self.streams.pop(id(sock), None)
 
     class Tor:
         def note_timeout(self, lane):
@@ -109,7 +119,7 @@ def main():
           "settimeout" in kinds
           and kinds.index("settimeout") < kinds.index("sendall"),
           f"order was {kinds} -- the send inherited a stale timeout")
-    # The send arms its OWN window, not the
+    # send arms
     check("the send arms its own window, not the read window",
           ("settimeout", mitm._SEND_TIMEOUT) in sock.calls,
           f"armed {[c for c in sock.calls if c[0] == 'settimeout']} "

@@ -66,9 +66,19 @@ def main():
         index = 1
         exit_country = "de"
         exit_ip = "1.2.3.4"
+        exit_fingerprint = "F" * 40
         socks_port = 0
         lock = threading.Lock()
         active = 0
+        streams = {}
+
+        def track_stream(self, sock, progress, hangup=None) -> None:
+            with self.lock:
+                self.streams[id(sock)] = (sock, progress, hangup)
+
+        def drop_stream(self, sock) -> None:
+            with self.lock:
+                self.streams.pop(id(sock), None)
 
     class Tor:
         def note_timeout(self, lane):
@@ -106,7 +116,7 @@ def main():
     for line in head.splitlines():
         print("     " + line)
 
-    # NOTE: the local `100 Continue` to the CLIENT
+    # NOTE:
     check("and it did NOT forward the expectation upstream",
           "expect" not in head.lower(),
           "the upstream is told to expect a 100-continue it will never get, "

@@ -11,9 +11,9 @@ from lingling import mitm  # noqa: E402
 
 FAILS = []
 
-#: highest `send_s` seen on a successful >=1MB upload, over 107 calls
+#: highest `send_s`
 MEASURED_MAX_UPLOAD_S = 29.8
-#: how much headroom the shipped window must keep over it
+#: how much
 HEADROOM = 3.0
 
 
@@ -73,9 +73,21 @@ class Lane:
     index = 1
     exit_country = "de"
     exit_ip = "1.2.3.4"
+    exit_fingerprint = "F" * 40
     socks_port = 0
     lock = threading.Lock()
     active = 0
+    streams: dict = {}
+
+    def track_stream(self, sock, progress, hangup=None) -> None:
+        """Register an open stream, so a dead exit can reach it."""
+        with self.lock:
+            self.streams[id(sock)] = (sock, progress, None)
+
+    def drop_stream(self, sock) -> None:
+        """Forget a stream that ended, or went into the pool."""
+        with self.lock:
+            self.streams.pop(id(sock), None)
 
 
 class Tor:

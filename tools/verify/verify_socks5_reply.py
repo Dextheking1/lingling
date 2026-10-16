@@ -91,8 +91,7 @@ def main():
         err, nxt = run(atyp)
         print(f"=== ATYP=0x{atyp:02x} ({label}) ===")
         print(f"  socks5_open -> {err!r}   next bytes -> {nxt!r}")
-        check(f"{label}: the handshake succeeds",
-              err == "", f"err={err!r}")
+        check(f"{label}: the handshake succeeds", err == "", f"err={err!r}")
         check(f"{label}: the socket is clean afterwards",
               nxt == MARKER,
               f"got {nxt!r} -- {len(nxt) - len(MARKER)} byte(s) of reply "

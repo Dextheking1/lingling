@@ -5,13 +5,16 @@ import os
 import ssl
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lingling import mitm, proof  # noqa: E402
-from lingling.lanes import TorManager, LIMITED_FALLBACK_S, LIMITED_PATH
+from lingling.bench import (FREE_LIMIT, LIMITED_PATH, RATE_LIMIT,
+                            RATE_LIMIT_FALLBACK_S)
+from lingling.lanes import TorManager
 
 FAIL = []
 
@@ -175,8 +178,9 @@ class FakeTor:
     def __init__(self):
         self.limited_calls = []
 
-    def note_limited(self, lane, retry_after=0.0):
-        self.limited_calls.append((lane.index, retry_after))
+    def note_limited(self, lane, retry_after=0.0, reason=RATE_LIMIT,
+                     fingerprint=""):
+        self.limited_calls.append((lane.index, retry_after, reason))
         lane.limited_until = mitm.time.time() + (retry_after or 600.0)
 
 
@@ -187,7 +191,7 @@ class FakeRelay:
         self.tunnels = None
         self.tor = FakeTor()
 
-    def report_refused(self, lane, status):
+    def report_refused(self, lane, status, fingerprint=""):
         self.refused.append(status)
 
 
@@ -210,7 +214,18 @@ class FakeLane:
     index = 3
     exit_country = "de"
     exit_ip = "1.2.3.4"
+    exit_fingerprint = "3" * 40
     socks_port = 9050
+    lock = threading.Lock()
+    streams = {}
+
+    def track_stream(self, sock, progress, hangup=None):
+        with self.lock:
+            self.streams[id(sock)] = (sock, progress, None)
+
+    def drop_stream(self, sock):
+        with self.lock:
+            self.streams.pop(id(sock), None)
 
 
 def chunk(data):
@@ -229,23 +244,37 @@ RESP = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
         b"transfer-encoding: chunked\r\n\r\n"
         + b"".join(chunk(s) for s in SSE) + b"0\r\n\r\n")
 
-#: the live 323.8 KB class: opencode's own static fetch, not a model call
+#: live 323.8
 _BIG = b'{"k":"v"},' * 40000
 API_JSON = (b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n"
             + b"content-length: %d\r\n\r\n" % len(_BIG) + _BIG)
 
-#: a plain small 200, also not a stream
+#: plain small
 PLAIN = (b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n"
          b"content-length: 9\r\n\r\n" + b'{"x":"y"}')
 
-#: a stream that opens, ends cleanly, and never carries the model
+#: stream
 SSE_EMPTY = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
              b"transfer-encoding: chunked\r\n\r\n"
              + chunk(b'event: ping\ndata: {}\n\n') + b"0\r\n\r\n")
 
-#: a 429 buffers, so nothing is ever relayed or sniffed. The retry-after is
+#: 429 buffers
 BUSY = (b"HTTP/1.1 429 Too Many Requests\r\ncontent-type: text/plain\r\n"
         b"retry-after: 12373\r\ncontent-length: 4\r\n\r\nbusy")
+
+#: free tier's
+_QUOTA_BODY = (b'{"type":"error","error":{"type":"FreeUsageLimitError",'
+               b'"message":"Free usage limit reached"}}')
+QUOTA = (b"HTTP/1.1 429 Too Many Requests\r\n"
+         b"content-type: application/json\r\nretry-after: 38323\r\n"
+         b"content-length: %d\r\n\r\n" % len(_QUOTA_BODY) + _QUOTA_BODY)
+
+#: their edge
+_EDGE_BODY = (b'{"error":{"type":"server_error",'
+              b'"message":"Upstream request failed: Endpoint is unavailable."}}')
+EDGE = (b"HTTP/1.1 429 Too Many Requests\r\n"
+        b"content-type: application/json\r\n"
+        b"content-length: %d\r\n\r\n" % len(_EDGE_BODY) + _EDGE_BODY)
 
 _real = (mitm.time, mitm.netutil.socks5_open, mitm.ssl.create_default_context,
          mitm.socket.socket)
@@ -313,13 +342,13 @@ THINK_ONLY = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
 check("reasoning frame stamped the event",
       events2[-1].get("first_event_s", 0) > 0,
       str(events2[-1].get("first_event_s")))
-# Reasoning-only is how a multi-block model thinks. It
+# Reasoning-only
 check("a reasoning-only 200 is NOT judged",
       "ghost" not in events2[-1], str(sorted(events2[-1])))
 check("it ended cleanly, so not cut", events2[-1]["cut"] is False)
 check("and it blames no lane", _r2.refused == [], str(_r2.refused))
 
-# The marker used to be the literal `"type":"reasoning"`,
+# marker used
 SPACED = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
           b"transfer-encoding: chunked\r\n\r\n"
           + chunk(b'event: response.output_item.added\ndata: '
@@ -352,7 +381,7 @@ check("keys present as 0, not missing",
       and events4[-1].get("first_event_s") == 0, str(events4[-1]))
 
 print("\n=== H2. a SOCKS5 refusal still reports an outcome ===")
-# It used to return without emitting, so the
+# used
 (_o14, events14, _c14, _r14) = drive(b"", socks_err="connection refused")
 check("the refusal is logged, not swallowed",
       len(events14) == 1 and events14[-1]["err"] == "connection refused",
@@ -362,15 +391,14 @@ check("and it is not dressed up as a success",
       str(events14[-1]["status"]))
 
 print("\n=== I. plain traffic is never judged as a model stream ===")
-# This proxy also carries opencode's own fetches. GET
+# proxy also
 (_o5, events5, _c5, relay5) = drive(PLAIN)
 check("a non-stream 200 carries no verdict", "ghost" not in events5[-1],
       str(sorted(events5[-1])))
 check("and it is not reported as cut", events5[-1]["cut"] is False)
 check("no model event was stamped", events5[-1]["first_event_s"] == 0,
       str(events5[-1]["first_event_s"]))
-check("and the exit is not blamed", relay5.refused == [],
-      str(relay5.refused))
+check("and the exit is not blamed", relay5.refused == [], str(relay5.refused))
 
 (_o12, events12, _c12, relay12) = drive(API_JSON)
 check("a ~350 KB static fetch carries no verdict either",
@@ -380,7 +408,7 @@ check("it still relays the whole body", events12[-1]["kb"] > 300,
 check("and it blames nobody", relay12.refused == [], str(relay12.refused))
 
 print("\n=== J. an empty stream is reported, and blames no lane ===")
-# An empty stream used to pull the lane.
+# empty stream
 (_o6, events6, _c6, relay6) = drive(SSE_EMPTY)
 check("an empty stream carries no verdict", "ghost" not in events6[-1],
       str(sorted(events6[-1])))
@@ -393,12 +421,11 @@ print("\n=== K. a 429 blames nothing here, and carries the server's reset ===")
 check("429 carries no verdict", "ghost" not in events7[-1],
       str(sorted(events7[-1])))
 check("429 not flagged cut", events7[-1]["cut"] is False)
-check("429 blames no lane here", relay7.refused == [],
-      str(relay7.refused))
+check("429 blames no lane here", relay7.refused == [], str(relay7.refused))
 check("429 records the far end's retry-after",
       events7[-1]["retry_after"] == 12373, str(events7[-1]["retry_after"]))
 
-print("\n=== K2. the handler records the exit's bounded deadline ===")
+print("\n=== K2. the handler writes the exit into the rate section ===")
 with tempfile.TemporaryDirectory() as tmp:
     manager_k = TorManager(Path(tmp), count=1, exit_countries=["de"])
     lane_k = manager_k.lanes[0]
@@ -418,18 +445,20 @@ with tempfile.TemporaryDirectory() as tmp:
     mitm.ssl.create_default_context = lambda: FakeCtx()
     mitm.socket.socket = lambda *a, **k: FakeSock(BUSY)
     try:
-        mitm._serve(client_k, "opencode.ai", 443, 13,
-                    events13.append, relay_k)
+        mitm._serve(client_k, "opencode.ai", 443, 13, events13.append, relay_k)
     finally:
         (mitm.time, mitm.netutil.socks5_open,
          mitm.ssl.create_default_context, mitm.socket.socket) = _real
-    check("the handler marks the lane limited",
-          lane_k.limited_until >= start_k + LIMITED_FALLBACK_S)
-    check("the global reset does not extend the exit's cooldown",
-          lane_k.limited_until <= time.time() + LIMITED_FALLBACK_S)
+    check("the handler benches the exit in the rate section",
+          lane_k.limit_reason == RATE_LIMIT, f"reason={lane_k.limit_reason!r}")
+    check("a burst limit's wait is capped at the stand-off",
+          start_k + RATE_LIMIT_FALLBACK_S - 1 <= lane_k.limited_until
+          <= time.time() + RATE_LIMIT_FALLBACK_S + 1,
+          f"{lane_k.limited_until - start_k:.0f}s")
     recorded_k = json.loads((Path(tmp) / LIMITED_PATH).read_text())
-    check("the same deadline is persisted for that relay",
-          recorded_k.get(lane_k.exit_fingerprint) == lane_k.limited_until)
+    check("the section and the deadline are persisted for that relay",
+          recorded_k.get(lane_k.exit_fingerprint) == {
+              "until": lane_k.limited_until, "reason": RATE_LIMIT})
     check("the refusal reaches the router", relay_k.refused == [429])
     check("the event preserves the server's original retry-after",
           events13[-1]["retry_after"] == 12373)
@@ -437,8 +466,110 @@ with tempfile.TemporaryDirectory() as tmp:
           client_k.got.startswith(b"HTTP/1.1 429")
           and b"retry-after: 12373" in client_k.got)
 
-print("\n=== L. a pooled tunnel is reused and asked to stay open ===")# The SOCKS5 CONNECT plus TLS handshake is ~1.3s of Tor round trips (measured
-# 546ms + 723ms warm), so a reused tunnel
+print("\n=== K3. each 429 has its section: the free wall, rate, or neither ===")
+# reads like
+check("a plain exit-limit 429 is the burst section",
+      mitm._limit_of(BUSY) == (RATE_LIMIT, 12373.0), str(mitm._limit_of(BUSY)))
+check("the free wall is its own section, and it carries its wait",
+      mitm._limit_of(QUOTA) == (FREE_LIMIT, 38323.0), str(mitm._limit_of(QUOTA)))
+check("opencode's own edge is in neither section",
+      mitm._limit_of(EDGE) == ("", 0.0), str(mitm._limit_of(EDGE)))
+
+with tempfile.TemporaryDirectory() as tmp:
+    manager_q = TorManager(Path(tmp), count=1, exit_countries=["de"])
+    lane_q = manager_q.lanes[0]
+    lane_q.healthy = True
+    lane_q.exit_fingerprint = "A" * 40
+    relay_q = FakeRelay()
+    relay_q.tor = manager_q
+    relay_q.pick_lane = lambda exclude=None: lane_q
+    relay_q.any_unlimited = lambda exclude: False
+    dials_q = []
+    request_q = (b"POST /zen/v1/responses HTTP/1.1\r\n"
+                 b"host: opencode.ai\r\ncontent-length: 13\r\n\r\n"
+                 b'{"model":"m"}')
+    client_q = ReqClient(request_q)
+    events_q = []
+    mitm.netutil.socks5_open = lambda *a, **k: ""
+    mitm.ssl.create_default_context = lambda: FakeCtx()
+
+    def dial_q(*_a, **_k):
+        sock = FakeSock(QUOTA)
+        dials_q.append(sock)
+        return sock
+
+    mitm.socket.socket = dial_q
+    start_q = time.time()
+    try:
+        mitm._serve(client_q, "opencode.ai", 443, 15, events_q.append, relay_q)
+    finally:
+        (mitm.time, mitm.netutil.socks5_open,
+         mitm.ssl.create_default_context, mitm.socket.socket) = _real
+    check("the spent exit is benched from the pool",
+          lane_q.limited_until > 0.0, f"limited_until={lane_q.limited_until}")
+    check("the bench is the wall's own reset, in the free section",
+          lane_q.limit_reason == FREE_LIMIT
+          and lane_q.limited_until - start_q >= 38323 - 2,
+          f"reason={lane_q.limit_reason!r} "
+          f"span={lane_q.limited_until - start_q:.0f}s")
+    check("the refusal reaches the handler, so the lane moves off it",
+          relay_q.refused == [429], f"refused={relay_q.refused}")
+    check("with no other lane left, the call does not dial again",
+          len(dials_q) == 1,
+          f"dials={len(dials_q)} -- retried with nowhere to go")
+    check("the client gets the far end's own 429",
+          client_q.got.startswith(b"HTTP/1.1 429") and b"FreeUsageLimitError"
+          in client_q.got, repr(client_q.got[:48]))
+    quota_end = [e for e in events_q if e.get("type") == "callend"]
+    check("the call still reports itself",
+          bool(quota_end) and quota_end[-1]["status"] == 429,
+          str(quota_end[-1] if quota_end else "nothing emitted"))
+    line = proof._render(quota_end[-1]) if quota_end else ""
+    check("the pane names the free section AND says the lane moves",
+          "free limit" in line and "moving it" in line, f"line={line!r}")
+    check("it never claims a lane cannot help",
+          "no lane" not in line, f"line={line!r}")
+
+print("\n=== K4. opencode's own edge is shown loudly, and never benched ===")
+with tempfile.TemporaryDirectory() as tmp:
+    manager_e = TorManager(Path(tmp), count=1, exit_countries=["de"])
+    lane_e = manager_e.lanes[0]
+    lane_e.healthy = True
+    lane_e.exit_fingerprint = "E" * 40
+    relay_e = FakeRelay()
+    relay_e.tor = manager_e
+    relay_e.pick_lane = lambda exclude=None: lane_e
+    relay_e.any_unlimited = lambda exclude: False
+    client_e = ReqClient(request_k)
+    events_e = []
+    mitm.netutil.socks5_open = lambda *a, **k: ""
+    mitm.ssl.create_default_context = lambda: FakeCtx()
+    mitm.socket.socket = lambda *a, **k: FakeSock(EDGE)
+    try:
+        mitm._serve(client_e, "opencode.ai", 443, 17, events_e.append,
+                    relay_e)
+    finally:
+        (mitm.time, mitm.netutil.socks5_open,
+         mitm.ssl.create_default_context, mitm.socket.socket) = _real
+    check("no exit is benched for their edge",
+          lane_e.limited_until == 0.0 and lane_e.limit_reason == "",
+          f"{lane_e.limited_until} {lane_e.limit_reason!r}")
+    book_e = Path(tmp) / LIMITED_PATH
+    check("and the notepad stays empty for it",
+          not book_e.exists() or json.loads(book_e.read_text()) == {},
+          book_e.read_text() if book_e.exists() else "no file -- nothing written")
+    line_e = proof._render(events_e[-1]) if events_e else ""
+    check("the pane says whose edge it is",
+          "OPENCODE EDGE UNAVAILABLE" in line_e, f"line={line_e!r}")
+    check("and says it is not this exit", "not this exit" in line_e,
+          f"line={line_e!r}")
+    check("the client still gets the far end's own 429",
+          client_e.got.startswith(b"HTTP/1.1 429")
+          and b"Endpoint is unavailable" in client_e.got,
+          repr(client_e.got[-60:]))
+
+print("\n=== L. a pooled tunnel is reused and asked to stay open ===")  # SOCKS5 CONNECT
+# 546ms +
 seeded = FakeSock(RESP)
 pool = FakePool((seeded, seeded._r))
 (out8, events8, _c8, relay8) = drive(RESP, pool=pool)
@@ -465,7 +596,7 @@ check("the response parsed", events9[-1]["status"] == 200)
 check("and it is not reported as reused", events9[-1]["reused"] is False)
 
 print("\n=== N. an EOF-framed response is never pooled ===")
-# Neither content-length nor chunked means the far end
+# Neither content-length
 EOF_FRAMED = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n"
               + b'data: {"type":"response.output_text.delta"}\n\n')
 pool2 = FakePool()
@@ -511,13 +642,13 @@ finally:
     mitm._peer_closed = real_closed
 
 print("\n=== P2. the pool cannot grow without bound ===")
-# Only `take` used to remove entries, so a
+# Only `take`
 pool = mitm.TunnelPool(ttl=30.0)
 lane = FakeLane()
 lane.exit_ip = "10.0.0.1"
 first = FakeSock(b"")
 pool.give(lane, first, None)
-lane.exit_ip = "10.0.0.2"          # re-pinned: the old tunnel is useless
+lane.exit_ip = "10.0.0.2"  # re-pinned:
 second = FakeSock(b"")
 pool.give(lane, second, None)
 check("a tunnel from the old exit is closed", first.closed)
@@ -526,7 +657,7 @@ check("and it is dropped from the pool",
 check("the current exit's tunnel is kept",
       pool._idle[lane.index][0][2] is second)
 
-# A negative ttl expires everything regardless of the
+# negative ttl
 old = mitm.TunnelPool(ttl=-1.0)
 lane2 = FakeLane()
 lane2.exit_ip = "10.0.0.3"
@@ -546,7 +677,7 @@ finally:
     left.close()
 
 print("\n=== R. proof pane rendering ===")
-os.environ.pop("NO_COLOR", None)  # the colour assertions need colour on
+os.environ.pop("NO_COLOR", None)  # colour assertions
 check("legacy event: payload only",
       proof._lat_bits({"kb": 12.5, "secs": 3.4}) == "12.5 KB in 3.4s",
       proof._lat_bits({"kb": 12.5, "secs": 3.4}))
@@ -572,7 +703,7 @@ check("a dialled tunnel does not",
                                        "reused": False}))
 line = proof._render(events[-1])
 check("full callend line builds", "first" in line and "event" in line, line)
-# The word is gone from the vocabulary, not
+# word
 check("no line ever says GHOST",
       all("GHOST" not in proof._render(e) for e in events + events2 + events5
           + events6 + events7),
@@ -588,12 +719,14 @@ check("an empty stream renders without a verdict",
       proof._render(events6[-1]))
 line429 = proof._render(events7[-1])
 check("a 429 renders as a step, not a failure",
-      "moving lanes" in line429 and "failed" not in line429, line429)
+      "limit -- exit out" in line429 and "failed" not in line429, line429)
+check("and it shows the bench the notepad will apply, not the raw header",
+      "25m" in line429 and "206m" not in line429, line429)
 check("a 429 is amber, not red",
       "\x1b[33m429" in line429, repr(line429[:40]))
 
 print("\n=== V. a transient upstream error buffers for a retry ===")
-# A 503 is the far end being unwell,
+# 503
 UNAVAILABLE = (b"HTTP/1.1 503 Service Unavailable\r\n"
                b"content-type: text/plain\r\ncontent-length: 3\r\n\r\n503")
 (_o15, events15, client15, _r15) = drive(UNAVAILABLE)
@@ -606,7 +739,7 @@ check("a plain 500 is not -- it may be a real error",
       500 not in mitm._RETRYABLE)
 
 print("\n=== W. a head with no body is retried, not committed ===")
-# The response head used to go to the
+# response head
 _HEAD_ONLY = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
               b"transfer-encoding: chunked\r\n\r\n")
 (out16, events16, client16, _) = drive(
@@ -619,7 +752,7 @@ check("and it names the error", events16[-1]["err"] == "SSLEOFError",
       str(events16[-1]["err"]))
 check("the attempt is retryable", out16[3] is True, f"retryable={out16[3]}")
 
-# The case the log actually shows: the far
+# case
 _PREAMBLE = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
              b"transfer-encoding: chunked\r\n\r\n"
              + chunk(b"event: response.created\n"))
@@ -629,7 +762,7 @@ check("the preamble alone is not a commitment", client18.got == b"",
       repr(client18.got[:48]))
 check("so it retries", out18[3] is True, f"retryable={out18[3]}")
 
-# And the boundary: the first real model event
+# boundary:
 _MODEL_EVENT = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
                 b"transfer-encoding: chunked\r\n\r\n"
                 + chunk(b'event: response.output_text.delta\ndata: '
@@ -643,7 +776,7 @@ check("and that attempt is not retried", out19[3] is False,
 check("the head went out with that event",
       client19.got.startswith(b"HTTP/1.1 200"), repr(client19.got[:24]))
 
-# And the buffer the hold introduces must be
+# buffer
 _FLOOD = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
           b"transfer-encoding: chunked\r\n\r\n"
           + b"".join(chunk(b": padding comment\n") for _ in range(6000))
@@ -656,7 +789,7 @@ check("and the stream still ended cleanly", events20[-1].get("cut") is False,
       str(events20[-1].get("cut")))
 
 print("\n=== U. the crypto stack is checked at startup ===")
-# The crypto import is lazy, so a gutted
+# crypto import
 check("crypto_available() is True on a working install",
       mitm.crypto_available())
 _cli_src = open(os.path.join(os.path.dirname(mitm.__file__), "cli.py"),
@@ -664,7 +797,7 @@ _cli_src = open(os.path.join(os.path.dirname(mitm.__file__), "cli.py"),
 check("and startup acts on it", "crypto_available" in _cli_src)
 
 print("\n=== S. the log carries a session marker ===")
-# `seq` restarts at 1 every run, so without
+# `seq` restarts
 import re as _re
 
 src = open(os.path.join(os.path.dirname(proof.__file__), "cli.py"),
@@ -679,21 +812,21 @@ check("and it is not mistaken for a request line",
       not _re.search(r"#\d+\.\d+", line_start), line_start)
 
 print("\n=== T. the log writer keeps the file open ===")
-# The old emitter opened and closed the log
+# old emitter
 with tempfile.TemporaryDirectory() as tmp:
     log = Path(tmp) / "proof.log"
     emit = proof.make_emitter(log)
     for i in range(50):
         emit({"type": "start", "t": 1000.0 + i, "session": f"s{i}",
               "lanes": 6, "countries": ["de"]})
-    # readable while the emitter still holds the handle
+    # readable while
     lines = log.read_text(encoding="utf-8").splitlines()
     check("every event landed", len(lines) == 50, str(len(lines)))
     check("and each is whole JSON",
           all(json.loads(ln)["session"] == f"s{i}"
               for i, ln in enumerate(lines)), "truncated or merged")
     emit.close()
-    log.unlink()      # fails while the handle is held
+    log.unlink()  # fails while
     check("closing really releases the file", not log.exists())
 
 print("\n" + "=" * 46)

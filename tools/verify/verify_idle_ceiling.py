@@ -37,10 +37,10 @@ def _serve_slow(first_at: float, gap0: float, think_for: float,
     port = srv.getsockname()[1]
 
     def run() -> None:
-        # A client that hangs up is normal here:
+        # client
         conn, _ = srv.accept()
         try:
-            time.sleep(first_at)                 # think before the head
+            time.sleep(first_at)  # think before
             conn.sendall(b"HTTP/1.1 200 OK\r\n"
                          b"Content-Type: text/event-stream\r\n"
                          b"Transfer-Encoding: chunked\r\n\r\n")
@@ -48,13 +48,13 @@ def _serve_slow(first_at: float, gap0: float, think_for: float,
             def chunk(body: bytes) -> None:
                 conn.sendall(b"%x\r\n" % len(body) + body + b"\r\n")
 
-            # framing only, no data: yet
+            # framing only
             chunk(b"event: response.created\n\n")
-            time.sleep(gap0)                     # first token lands here
+            time.sleep(gap0)  # first token
             deadline = time.time() + think_for
             while time.time() < deadline:
                 chunk(b'data: {"type":"response.reasoning.delta","delta":"x"}\n\n')
-                time.sleep(gap)                  # a byte every `gap` seconds
+                time.sleep(gap)  # byte every
             chunk(b'data: {"type":"response.completed"}\n\n')
             conn.sendall(b"0\r\n\r\n")
         except OSError:
@@ -83,7 +83,12 @@ def _run_case(first_at: float, gap0: float, think_for: float,
     events: list = []
     lane = type("L", (), {
         "index": 1, "exit_country": "de", "exit_ip": "1.2.3.4",
+        "exit_fingerprint": "F" * 40,
         "socks_port": port, "lock": threading.Lock(), "active": 0,
+        "streams": {},
+        "track_stream": lambda self, sock, progress, hangup=None:
+            self.streams.__setitem__(id(sock), (sock, progress, hangup)),
+        "drop_stream": lambda self, sock: self.streams.pop(id(sock), None),
     })()
     relay = type("R", (), {"tor": None})()
 
@@ -125,7 +130,7 @@ def main() -> int:
     print("  head at 1s, first token at 19s, then bytes every 1.0s for 60s")
     print(f"  result: ok={ok}  wall={secs:.1f}s  bytes={kb} KB  "
           f"first_event={fes}s  err={err!r}")
-    # The claim is that the ceiling is IDLE,
+    # claim
     survived = secs >= 75 and fes >= 18 and kb >= 2
     print(f"  [{'PASS' if survived else 'FAIL'}] survived all 79s"
           f"  (needed >=75s and >=2KB, got {secs:.1f}s / {kb}KB)")
@@ -141,7 +146,7 @@ def main() -> int:
           f"  (needed <24s, got {secs2:.1f}s)")
 
     print("\n=== a silence past the POST-commit ceiling still cuts it ===")
-    # `post` is set below the 25s gap on
+    # `post`
     ok3, secs3, kb3, fes3, err3 = _run_case(first_at=1.0, gap0=1.0,
                                             think_for=1.0, gap=25.0,
                                             ceiling=20.0, post=10.0)
@@ -153,7 +158,7 @@ def main() -> int:
           f"  (needed first_event>0, got {fes3}s)")
 
     print("\n=== but a gap UNDER the post-commit ceiling is a think-pause ===")
-    # The owner's actual failure: a committed stream that
+    # owner's actual
     ok4, secs4, kb4, fes4, err4 = _run_case(first_at=1.0, gap0=1.0,
                                             think_for=1.0, gap=8.0,
                                             ceiling=20.0, post=10.0)

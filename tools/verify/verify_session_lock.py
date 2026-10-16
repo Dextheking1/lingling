@@ -53,15 +53,13 @@ def main() -> int:
     print("\n=== release really lets go ===")
     netutil.release_session_lock(str(d))
     check("the file is gone", not lock.exists())
-    check("and the lock is free again",
-          netutil.session_lock(str(d)) is None)
+    check("and the lock is free again", netutil.session_lock(str(d)) is None)
     netutil.release_session_lock(str(d))
     check("a second release is harmless", not lock.exists())
 
     print("\n=== wreckage from a hard kill is swept, not honoured ===")
     lock.write_text("999999")
-    check("a dead holder does not block",
-          netutil.session_lock(str(d)) is None)
+    check("a dead holder does not block", netutil.session_lock(str(d)) is None)
     netutil.release_session_lock(str(d))
 
     print("\n=== a pid that gets reused by an unrelated process ===")
@@ -79,8 +77,7 @@ def main() -> int:
           netutil.session_lock(str(d)) is None)
     netutil.release_session_lock(str(d))
     lock.write_text("")
-    check("an empty lock does not block",
-          netutil.session_lock(str(d)) is None)
+    check("an empty lock does not block", netutil.session_lock(str(d)) is None)
     netutil.release_session_lock(str(d))
 
     print("\n=== corruption at the exact moment of two racers ===")

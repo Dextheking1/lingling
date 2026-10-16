@@ -135,7 +135,7 @@ def main():
         try:
             ctl = open_control(lane.control_port)
         except Exception as exc:  # noqa: BLE001
-            # Full traceback, not just the type name: the
+            # Full traceback
             import traceback
             traceback.print_exc()
             print(f"   [SKIP] control port unreadable: {type(exc).__name__}")
@@ -160,7 +160,7 @@ def main():
                 print("  - " + f)
             return 1
         if not verified:
-            # The credential is accepted, but the claim that
+            # credential
             print("INCONCLUSIVE: credential accepted, isolation NOT verified")
             return 1
         print("CIRCUIT ISOLATION: CONFIRMED")

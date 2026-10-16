@@ -99,9 +99,19 @@ class Lane:
     index = 1
     exit_country = "de"
     exit_ip = "1.2.3.4"
+    exit_fingerprint = "F" * 40
     socks_port = 0
     lock = threading.Lock()
     active = 0
+    streams = {}
+
+    def track_stream(self, sock, progress, hangup=None):
+        with self.lock:
+            self.streams[id(sock)] = (sock, progress, None)
+
+    def drop_stream(self, sock):
+        with self.lock:
+            self.streams.pop(id(sock), None)
 
 
 class Tor:

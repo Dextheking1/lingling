@@ -53,13 +53,11 @@ def main():
     print("\n=== the plain path is unchanged ===")
     got = _model_of(body())
     print(f"  model only            -> {got!r}")
-    check("a body with no parameters logs the bare model",
-          got == MODEL, got)
+    check("a body with no parameters logs the bare model", got == MODEL, got)
 
     got = _model_of(body(reasoning={"effort": ""}))
     print(f"  empty effort          -> {got!r}")
-    check("an empty effort does not fabricate a parameter",
-          got == MODEL, got)
+    check("an empty effort does not fabricate a parameter", got == MODEL, got)
 
     print("\n=== a body that does not parse is not a new failure mode ===")
     for bad, label in ((b"not json", "garbage"), (b"", "empty"),

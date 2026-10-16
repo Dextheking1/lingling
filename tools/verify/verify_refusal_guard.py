@@ -1,9 +1,4 @@
-"""The health probe's 429 actually reaches the refusal handler.
-
-And the relay's own 429 -- the one a real call runs into -- survives a
-move that blows up: the client already made its call, so a hook that
-raises may not take the request down with it.
-"""
+"""The health probe's 429 actually reaches the refusal handler"""
 import pathlib
 import socket
 import sys
@@ -44,10 +39,15 @@ class StubTor:
         self.limit_hook = None
         self.lanes = []
 
-    def note_limited(self, lane, retry_after=0.0):
+    def note_limited(self, lane, retry_after=0.0, reason="rate",
+                     fingerprint=""):
         self.limited += 1
         lane.limited_until = time.time() + 600.0
         return lane.limited_until
+
+    def claim_move(self, lane):
+        """One burst on one lane is one move; one probe is asking here."""
+        return True
 
     def rotate_exit_country(self, lane):
         self.rotations += 1
@@ -68,8 +68,7 @@ def sweep(reply):
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="lingling-wire-"))
     tor = StubTor()
     daemon = health.HealthDaemon(tor)
-    # The lane has to really listen. A lane with nothing on its own SOCKS
-    # port is down, and `check_once` revives that instead of probing it.
+    # lane has
     with socket.socket() as srv:
         srv.bind(("127.0.0.1", 0))
         srv.listen()
@@ -78,7 +77,7 @@ def sweep(reply):
         lane.exit_fingerprint = "A" * 40
         lane.process = FakeProc()
         lane.healthy = True
-        # asked to run: the daemon now leaves a
+        # asked
         lane.wanted = True
         lane.asked = False
         tor.lanes = [lane]
@@ -129,7 +128,7 @@ def main():
           f"429 did not reach the refusal handler")
 
     print("\n=== a 403 probe leaves the lane in service ===")
-    # A 403 means the exit is FINE --
+    # 403 means
     tor, lane = sweep(403)
     print(f"  rotations={tor.rotations} restarts={tor.restarts} "
           f"asked={lane.asked}")
@@ -138,15 +137,11 @@ def main():
           f"rotations={tor.rotations} asked={lane.asked}")
 
     print("\n=== a 429 the relay sees survives a move that blows up ===")
-    # The refusal arrives from a real call, inside the connection thread:
-    # stem 1.8.2 builds AuthChallengeFailed with an argument its
-    # constructor does not take, so moving the lane raised a TypeError
-    # that reached the thread boundary as a traceback, mid-TUI, on the
-    # request whose 429 triggered it.
+    # refusal arrives
     boom = TypeError("AuthChallengeFailed.__init__() takes 3 positional "
                     "arguments but 4 were given")
 
-    def exploding_move(lane, status):
+    def exploding_move(lane, status, fingerprint=""):
         raise boom
 
     tor, lane, events, raised = relay_sees(exploding_move)

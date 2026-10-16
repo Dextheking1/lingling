@@ -31,6 +31,7 @@ class FakeLane:
         self.index = index
         self.exit_country = cc
         self.exit_ip = f"1.2.3.{index}"
+        self.exit_fingerprint = f"{index:040X}"
         self.socks_port = 0
         self.healthy = True
         self.healing = False
@@ -42,6 +43,17 @@ class FakeLane:
         self.process = None
         self.lock = threading.Lock()
         self.active = 0
+        self.streams = {}
+
+    def track_stream(self, sock, progress, hangup=None) -> None:
+        """Register an open stream, so a dead exit can reach it."""
+        with self.lock:
+            self.streams[id(sock)] = (sock, progress, None)
+
+    def drop_stream(self, sock) -> None:
+        """Forget a stream that ended, or went into the pool."""
+        with self.lock:
+            self.streams.pop(id(sock), None)
 
 
 class FakeTor:
@@ -91,7 +103,7 @@ def elect(tor, samples):
     return picked
 
 
-# ---- mitm-level harness (cleartext fake upstream) ----
+# ---- mitm-level
 
 def start_upstream(delay):
     """SOCKS5 upstream: head at once, first event after `delay` seconds."""
@@ -226,7 +238,7 @@ def main():
           "sticky" in kinds, f"{kinds}")
 
     print("\n=== (B) a verdict on the favorite wakes the others ===")
-    tor.sticky.on_verdict(1)   # not the winner
+    tor.sticky.on_verdict(1)  # not
     check("a verdict on another lane changes nothing",
           tor.sticky.stuck_on(2), f"winner={tor.sticky.winner}")
     tor.sticky.on_verdict(2)   # the winner
@@ -244,7 +256,7 @@ def main():
           f"got lane {lane.index}")
 
     print("\n=== (D) the release ceiling: 15s on the stuck lane, not 20 ===")
-    # D1: the event crosses the release ceiling -- the full drop fires early
+    # D1:
     tor = FakeTor()
     relay = type("R", (), {"tor": tor})()
     elect(tor, {1: 1.0, 2: 9.0, 3: 9.0, 4: 9.0, 5: 9.0})
@@ -259,7 +271,7 @@ def main():
     check("the drop wakes the others for a new round",
           not tor.sticky.stuck_on(1) and tor.sticky.winner is None,
           f"winner={tor.sticky.winner}")
-    # D2: under the release ceiling, nothing fires -- the stick holds
+    # D2: under
     tor = FakeTor()
     relay = type("R", (), {"tor": tor})()
     elect(tor, {1: 1.0, 2: 9.0, 3: 9.0, 4: 9.0, 5: 9.0})
@@ -272,9 +284,7 @@ def main():
           f"slow={tor.slow} stuck={tor.sticky.stuck_on(1)}")
 
     print("\n=== (E) an elected lane does not bench the others ===")
-    # A stick used to bench the lanes it was not riding from the sweep too.
-    # That is unsafe now, when every lane carries every call: a lane with
-    # no verdict yet has to keep being asked for one.
+    # stick used
     health.netutil.port_is_open = lambda *a, **k: True
     tor = FakeTor()
     daemon = SpyDaemon(tor)
@@ -294,13 +304,13 @@ def main():
           later_sweep == [1, 2, 3, 4, 5], f"{later_sweep}")
 
     print("\n=== (F) a lane that fails mid-round is skipped, not waited for ===")
-    # F1: the verdict lands after the survivors' times -- production order
+    # F1:
     tor = FakeTor()
     for _ in range(5):
         tor.sticky.next_lane()
     for idx, secs in {1: 6.0, 2: 3.0, 3: 11.0, 5: 8.0}.items():
         tor.sticky.record(idx, secs)
-    # lane 4's 429: note_limited marks it, the verdict reaches the router
+    # lane 4's
     tor.lanes[3].limited_until = time.time() + 600
     tor.sticky.on_verdict(4)
     check("the election ran without lane 4 -- failed is tried",
@@ -313,11 +323,11 @@ def main():
     round2 = tor.sticky.next_lane().index
     check("a re-cooking lane gets no round slot until it is back",
           round2 != 4, f"round2 lane {round2}")
-    # F2: the rebuild lands before the last survivor's time
+    # F2:
     tor = FakeTor()
     for _ in range(5):
         tor.sticky.next_lane()
-    tor.lanes[3].healing = True   # lane 4 is already re-cooking
+    tor.lanes[3].healing = True  # lane 4
     for idx, secs in {1: 6.0, 2: 3.0, 3: 11.0, 5: 8.0}.items():
         tor.sticky.record(idx, secs)
     check("the election fires at the last sample, no lane 4 needed",
@@ -330,7 +340,7 @@ def main():
     for _ in range(5):
         idx = tor.sticky.next_lane().index
         picked.append(idx)
-        tor.sticky.record(idx, 5.0 + idx)   # every lane is 6..10s
+        tor.sticky.record(idx, 5.0 + idx)  # every lane
         seen.append(tor.sticky.winner)
     check("no lane sticks when every lane is over the threshold",
           seen == [None, None, None, None, None], f"{seen}")
@@ -344,18 +354,15 @@ def main():
     tor = FakeTor()
     for _ in range(5):
         tor.sticky.next_lane()
-    tor.sticky.record(1, 8.0)   # over the threshold: passed over
-    tor.sticky.record(2, 4.0)   # under it: this one wins
-    tor.sticky.record(3, 1.0)   # faster, but the ride already started
+    tor.sticky.record(1, 8.0)  # over
+    tor.sticky.record(2, 4.0)  # under
+    tor.sticky.record(3, 1.0)  # faster,
     check("the first lane under the threshold wins, not the lowest",
           tor.sticky.winner == 2 and tor.sticky.stuck_on(2),
           f"winner={tor.sticky.winner}")
 
     print("\n=== (I) only a model call may elect a lane ===")
-    # opencode itself fetches `models.opencode.ai/api.json` the moment it
-    # starts. It is not a model call, so it must never win the round -- the
-    # proof pane used to announce "lane 1 answered in 1.4s" before the user
-    # typed anything, because a fast metadata fetch was counted as an answer.
+    # opencode itself
     events = []
     tor = FakeTor(emit=events.append)
     relay = type("R", (), {"tor": tor})()
@@ -370,7 +377,7 @@ def main():
           tor.sticky.winner is None, f"winner={tor.sticky.winner}")
     check("and it says nothing in the proof pane",
           not any(e.get("kind") == "sticky" for e in events), f"{events}")
-    # the positive control: the same fast timing on a model call still elects
+    # positive control
     tor = FakeTor()
     port = start_upstream(0.2)
     tor.lanes[0].socks_port = port

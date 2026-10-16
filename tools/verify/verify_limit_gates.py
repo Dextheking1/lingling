@@ -37,7 +37,7 @@ class FakeTor:
     """Lanes with a controllable process, and a record of what was asked."""
 
     def __init__(self, n=6):
-        # `wanted=True` because these lanes are meant to be
+        # `wanted=True` because
         self.lanes = [
             Lane(index=i, socks_port=52000 + i, control_port=52300 + i,
                  exit_country="xx", data_dir=Path("."),
@@ -58,12 +58,17 @@ class FakeTor:
     def note_result(self, country, status):
         self.notes.append((country, status))
 
+    def claim_move(self, lane):
+        """One burst on one lane is one move; one refusal is asking here."""
+        return True
+
     def rotate_exit_country(self, lane):
         self.rotated.append(lane.index)
         lane.exit_country = "yy"
         return "yy"
 
-    def note_limited(self, lane, retry_after=0.0):
+    def note_limited(self, lane, retry_after=0.0, reason="rate",
+                     fingerprint=""):
         lane.limited_until = time.time() + 3600.0
         return lane.limited_until
 
@@ -75,11 +80,7 @@ class FakeTor:
         return True
 
 
-#: These fake lanes stand in for a live pool, so their ports answer. The
-#: sweep now treats a lane with nothing on its own SOCKS port as down, and
-#: this suite is about limit/refusal semantics, not port liveness -- see
-#: verify_lane_revive for that. Without this, the fixture would depend on
-#: whatever happens to be listening on 52001..52006 on the test machine.
+#: These fake
 H.netutil.port_is_open = lambda *a, **k: True
 
 
@@ -91,7 +92,7 @@ def daemon(n=6):
 
 
 print("\n=== A. a real 429 moves that one lane to a fresh exit ===")
-# A 429 is the far end's own words
+# 429
 tor, _d, ev = daemon()
 Relay(tor).report_refused(tor.lanes[0], 429)
 check("the exit is scored", tor.notes == [("xx", 429)], str(tor.notes))
@@ -108,30 +109,30 @@ check("the message names the new country",
       str([e.get("msg") for e in ev]))
 
 print("\n=== B. a 403 moves nothing ===")
-# The free tier gates on the CLIENT: a
+# free tier
 check("403 is not retryable", 403 not in mitm._RETRYABLE)
 check("429 is retryable", 429 in mitm._RETRYABLE)
 check("there is no second refusal set", not hasattr(mitm, "_REFUSED"))
-# The heading above promises this and it was
+# heading above
 tor, _d, _ev = daemon()
 Relay(tor).report_refused(tor.lanes[0], 403)
 check("a 403 moves nothing", not tor.restarted and not tor.rotated,
       f"restarted={tor.restarted} rotated={tor.rotated}")
 
 print("\n=== C. a lane whose tor has exited is restarted ===")
-# A process fact, not a judgement about the
+# process fact
 tor, d, ev = daemon()
 tor.lanes[1].process = FakeProc(code=1)
 d.check_once()
 check("the dead lane is restarted", tor.restarted == [2], str(tor.restarted))
-# Check the EVENT, not its wording. This asserted
+# Check
 check("and it says so",
       any(e.get("type") == "lane" and e.get("kind") == "up"
           and e.get("lane") == 2 for e in ev),
       str([e.get("msg") for e in ev]))
 
 print("\n=== D. a lane already asked is left alone ===")
-# No periodic probing: a lane is asked once,
+# No periodic
 tor, d, ev = daemon()
 for _l in tor.lanes:
     _l.asked = True
@@ -184,13 +185,12 @@ async def _unreachable(lane, host, port):
 
 
 print("\n=== E. a failed dial retires nothing ===")
-# The plain-CONNECT path carries everything that is not
+# plain-CONNECT path
 tor, d, ev = daemon()
 relay = Relay(tor, event=ev.append)
-relay.wait_budget = 0.05  # do not sit in the retry loop for 90s
+relay.wait_budget = 0.05  # do not
 relay._dial = _unreachable
-head = (b"CONNECT github.com:443 HTTP/1.1\r\n"
-        b"host: github.com:443\r\n\r\n")
+head = (b"CONNECT github.com:443 HTTP/1.1\r\n" b"host: github.com:443\r\n\r\n")
 w = FakeWriter()
 asyncio.run(relay._handle(FakeReader(head), w))
 check("a failed dial says so", any("couldn't reach" in e.get("msg", "") for e in ev),
@@ -201,12 +201,11 @@ check("nothing is re-cooked", tor.restarted == [], str(tor.restarted))
 check("the client still gets an answer", b"502" in w.got, repr(w.got[:24]))
 
 print("\n=== G. a refusal whose lane work blows up still answers ===")
-# Moving a lane is upkeep, not the request: the call the client already
-# made has to survive whatever the hook does with it.
+# Moving
 tor, _d, ev = daemon()
 
 
-def _boom(lane, status):
+def _boom(lane, status, fingerprint=""):
     raise TypeError("AuthChallengeFailed.__init__() takes 3 positional "
                     "arguments but 4 were given")
 
@@ -224,7 +223,7 @@ check("and the pane is told the move failed",
       str([e.get("msg") for e in ev if e.get("kind") == "fail"]))
 
 print("\n=== F. there is no concurrency cap ===")
-# Holding traffic while a healthy lane sat idle,
+# Holding traffic
 tor, _d, _e = daemon()
 for _l in tor.lanes:
     _l.active = 5

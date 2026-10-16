@@ -1,32 +1,4 @@
-"""`lingling update`, and the check that rides a launch.
-
-Two properties matter more than any other, and both are about what does
-*not* happen.
-
-The launch must not wait. A stale build is a nuisance; a boot that hangs
-on a dead endpoint is a bug. So the check is a thread with a deadline, and
-these tests run it against a local server, including a black hole that
-accepts connections and never answers.
-
-The install must not land under a running lingling. On Windows the console
-launcher is the running image and `pip install --upgrade` wants to replace
-it, so the default path hands the install to a helper that waits for the
-process to exit. The test for that is the two-sided one in section 8: no
-install while a process is alive, install once it is gone. Both halves
-have to hold, or the fix is worse than the bug.
-
-The install is offered, not sprung. With a terminal on both ends the
-handoff asks, and the notice stops promising; with a redirected stream, a
-shortcut or a service it does not ask, and the silent install those
-machines need still runs. Sections 19-24 pin every branch of that, down
-to a real launch that must come back on its own with a closed stdin.
-
-Everything is local: a throwaway data dir via LINGLING_DATA_DIR, a manifest
-served from a thread on 127.0.0.1, and the registry redirected at it too --
-except in section 9, where a real PyPI answer is the point.
-
-    python tools/verify/verify_update.py
-"""
+"""No install while a process is alive; install once it is gone."""
 import contextlib
 import io
 import json
@@ -74,7 +46,7 @@ def cleanup() -> None:
 
 
 # ---------------------------------------------------------------------------
-# a manifest, on this machine
+# local manifest
 # ---------------------------------------------------------------------------
 
 class _Server(BaseHTTPRequestHandler):
@@ -221,10 +193,7 @@ def section_versions():
 def section_check(url):
     print("\n=== 2. the check: manifest first, registry as the fallback ===")
     data = scratch()
-    # PYPI_URL is patched too, not just the manifest URL: leaving it alone
-    # would let the fallback reach the real registry, so "both sources are
-    # down" would quietly mean "PyPI answered" and the negative cases below
-    # would pass or fail depending on whether this machine is online.
+    # PYPI_URL
     with patched(PYPI_URL=url + "/pypi"), env_swap(LINGLING_UPDATE_URL=url):
         PAYLOAD["manifest"] = manifest(latest="9.9.9")
         PAYLOAD["pypi"] = "9.9.9"
@@ -274,8 +243,7 @@ def section_check(url):
         check("the check starts without waiting for the answer",
               elapsed < 0.5, f"start() took {elapsed:.2f}s")
         info = obj.wait(15) if obj else None
-        # PyPI is still reachable from here, so what matters is not the
-        # value but that a real answer arrived inside the budget.
+        # PyPI
         check("the thread finishes inside its budget", obj is not None
               and obj.done.is_set(), "the check thread never finished")
         check("a black-holed endpoint is never read as a version",
@@ -381,15 +349,7 @@ def section_install():
 
 
 def section_launcher():
-    """The one file an upgrade cannot replace while lingling runs.
-
-    Both halves of this were wrong in the first cut, and both were found
-    by running it rather than by reading it: a pip console script reports
-    ``argv[0]`` with no extension, and ``sys.executable``'s directory is
-    not the script directory in a global install. Either mistake makes
-    the parking below dead code, which is invisible until pip has to move
-    the running image itself.
-    """
+    # argv[0] has
     print("\n=== 9. the launcher lock: which file, and when to park it ===")
     fake = scratch()
     real_dir = update.scripts_dir()
@@ -438,8 +398,7 @@ def section_deferral():
     data = scratch()
     marker = data / "installed.txt"
     script = data / "marker.py"
-    # Writes its own argv, and speaks on both streams, so the assertion
-    # can see *which* installer ran and whether its output survived.
+    # Writes
     script.write_text(
         "import pathlib, sys\n"
         "print('installer stdout line')\n"
@@ -448,8 +407,7 @@ def section_deferral():
         "raise SystemExit(7)\n",
         encoding="utf-8")
 
-    # The child stands in for a live session: it schedules the install and
-    # then keeps running. That window is the one that must be safe.
+    # child stands
     child = (
         "import sys, time\n"
         f"sys.path.insert(0, {str(ROOT)!r})\n"
@@ -487,9 +445,7 @@ def section_deferral():
             proc.kill()
 
     log = data / "update.log"
-    # The exit line lands a beat after the marker: the installer writes the
-    # marker, exits, and only then does the helper report the code. Wait for
-    # it, so a slow machine is not a false failure.
+    # exit line
     deadline = time.time() + 30
     text = ""
     while time.time() < deadline:
@@ -524,8 +480,7 @@ def section_command(url):
     check("it prints lingling's help, not opencode's",
           "move to the newest lingling" in out and "npm uninstall" not in out,
           out[:200])
-    # Collapse the wrapping: the help is prose, and a phrase that reads as
-    # one sentence on screen can straddle a newline in the captured text.
+    # Collapse
     flat = " ".join(out.split())
     check("the bootstrap truth is stated in the help",
           "cannot check can never learn it is stale" in flat, flat[:300])
@@ -535,10 +490,7 @@ def section_command(url):
     check("--check exits 0", code == 0, f"code={code} {out[:200]}")
     check("it reports what is installed and what is available",
           CURRENT in out and "9.9.9" in out, out[:300])
-    # Compared against itself rather than against the source tree. On a
-    # working copy the tree is normally one revision ahead of whatever pip
-    # last installed, and demanding the two match failed for a reason that
-    # had nothing to do with --check.
+    # Compared against
     check("--check changes nothing on this machine",
           update.installed_version() == before,
           f"{before} -> {update.installed_version()}")
@@ -589,25 +541,13 @@ def section_command(url):
     check("it exits non-zero", code != 0, f"code={code}")
     check("it says it could not reach the servers",
           "could not reach" in out, out[:250])
-    check("and never claims to be current",
-          "newest" not in out, out[:250])
+    check("and never claims to be current", "newest" not in out, out[:250])
     check("it offers the command to do it by hand",
           "install by hand" in out, out[:250])
 
 
 def section_job():
-    """The bug that made the whole feature useless in the field.
-
-    A real launch joins a KILL_ON_JOB_CLOSE job (lanes.py, on its first
-    lane), and Windows pulls every child of a job member into that job
-    whether the child asks or not. So the detached installer was killed
-    at the instant lingling exited -- exactly when it was supposed to run
-    -- while the log still said it had been scheduled. Every test above
-    passed throughout, because none of them created a job.
-
-    The control is the point: an ordinary child must die. Without it this
-    test would also pass on a machine where the job was never created.
-    """
+    """The bug that made the whole feature useless in the field"""
     print("\n=== 17. the installer escapes the Windows kill job ===")
     if os.name != "nt":
         print("  (not Windows -- no job object to escape)")
@@ -624,8 +564,7 @@ def section_job():
                     "time.sleep(6)\n"
                     "pathlib.Path(sys.argv[1]).write_text('ran')\n",
                     encoding="utf-8")
-    # The child joins the kill job, starts a plain child that will still be
-    # asleep when the job closes, schedules the real helper, then exits.
+    # child joins
     child = (
         "import subprocess, sys\n"
         f"sys.path.insert(0, {str(ROOT)!r})\n"
@@ -646,7 +585,7 @@ def section_job():
     check("the detached installer outlives the job that owns us",
           escaped.exists(),
           "the job killed it -- so no session would ever install an update")
-    # Give the control longer than its 6s sleep, so absence is meaningful.
+    # Give
     waited = time.time() + 9
     while time.time() < waited:
         time.sleep(0.5)
@@ -720,7 +659,7 @@ class _WindowWatcher(threading.Thread):
         super().__init__(daemon=True)
         self.baseline = _visible_console_windows()
         self.peak = self.baseline
-        self._halt = False          # not _stop: Thread._stop() is a method
+        self._halt = False  # not _stop
 
     def run(self):
         while not self._halt:
@@ -732,12 +671,11 @@ class _WindowWatcher(threading.Thread):
         self.join()
 
 
-#: DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP -- how the helper is spawned,
-#: so it has no console of its own. That is the whole cause of the bug below.
+#: DETACHED_PROCESS |
 _DETACHED = 0x00000008 | 0x00000200
 
 
-#: CREATE_NO_WINDOW. Unflagged is the control, and it must flash.
+#: CREATE_NO_WINDOW. Unflagged
 _NO_FLAGS = 0
 
 
@@ -756,21 +694,7 @@ def _shake(data, flags, env):
 
 
 def section_nowindow():
-    """The helper must not flash a terminal twice a second.
-
-    The helper runs DETACHED_PROCESS, so it has no console, and Windows
-    hands a console-mode child of a console-less parent a BRAND NEW console
-    -- a visible one. Its liveness poll called tasklist every half a second
-    for as long as lingling ran, so the field report of "terminals spamming
-    when the timer finished" was this loop, not the proof pane: it starts at
-    the handoff because that is where the helper is spawned, and it stops
-    when the helper does.
-
-    Run, not inspected: the shipped helper source, detached, watching this
-    live process so it keeps polling. The control spawns the same tasklist
-    WITHOUT the flag and must produce a window -- otherwise the sampler is
-    blind and the check above proves nothing at all.
-    """
+    """The helper must not flash a terminal twice a second"""
     print("\n=== 18. the installer helper cannot flash a console window ===")
     if os.name != "nt":
         print("  (not Windows -- no console allocation to suppress)")
@@ -787,9 +711,7 @@ def section_nowindow():
           f"peaked at {w.peak} visible console windows from {w.baseline} -- "
           "a terminal flashing for the whole session")
 
-    # And the installer it hands off to must stay hidden too: explicit
-    # stdout/stderr streams do not change console allocation, but the flag
-    # that does is one refactor away from being dropped.
+    # installer
     touched = data / "installer-ran.txt"
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait()
@@ -822,13 +744,7 @@ def section_nowindow():
 
 
 def section_question():
-    """Who gets asked, and -- the point -- who does not.
-
-    The install used to be silent and automatic, which is exactly what
-    an unattended machine needs. The question is for the person who is
-    watching, and every path where nobody is watching has to fall back
-    to that old behaviour rather than to a hang.
-    """
+    """Who gets asked, and -- the point -- who does not"""
     print("\n=== 19. an update is offered, and only to someone who can answer ===")
     newer = {"latest": "9.9.9", "min_supported": None, "notice": None}
     current = {"latest": CURRENT, "min_supported": None, "notice": None}
@@ -1005,13 +921,7 @@ def section_notice_ask():
 
 
 def section_handoff():
-    """The CLI's own handoff function, driven through both branches.
-
-    Section 22 proves the wording; this proves the wiring -- that the
-    one decision reaches both the notice and the question, and that a
-    launch which cannot be asked still schedules the install instead of
-    waiting for an answer that never comes.
-    """
+    """The one decision reaches both the notice and the question."""
     print("\n=== 23. the handoff: one decision, one notice, one question ===")
     from lingling import cli
 
@@ -1064,17 +974,7 @@ def section_handoff():
 
 
 def section_launch(url):
-    """A real launch with a redirected stdin: no question, no hang.
-
-    The one regression this feature could introduce is a launch that
-    blocks on a question whose answer nobody can see -- a service, a
-    shortcut, `lingling | tee log`. So this runs the real entry point
-    with stdin closed and an update waiting, and requires it to return
-    on its own. Whether the install was *scheduled* is deliberately not
-    asserted: the check rides the boot, and this fake boot is over in
-    milliseconds, so a notice that never got to speak is the documented
-    behaviour rather than a failure.
-    """
+    """A real launch with a redirected stdin: no question, no hang"""
     print("\n=== 24. a launch nobody can be asked never waits on an answer ===")
     data = scratch()
     PAYLOAD["manifest"] = manifest(latest="9.9.9")
@@ -1083,8 +983,7 @@ def section_launch(url):
     installer.write_text("import pathlib, sys\n"
                          "pathlib.Path(sys.argv[1]).write_text('ran')\n",
                          encoding="utf-8")
-    # A console program for `shutil.which` to find. The interpreter makes
-    # a faithful stand-in: it starts, sees a closed stdin, and exits 0.
+    # console program
     bindir = data / "bin"
     bindir.mkdir()
     shutil.copyfile(sys.executable, bindir / "opencode.exe")
@@ -1092,10 +991,7 @@ def section_launch(url):
     env = env_for(url, {
         "LINGLING_UPDATE_CMD": f'"{sys.executable}" "{installer}" "{ran}"',
         "LINGLING_NO_MITM": "1",
-        # env_for() deliberately drops this, and a launch reads the cache
-        # of whatever data dir it is given: without it the fake 9.9.9 in
-        # this manifest would be written into the user's own lingling-data
-        # and every real check for the next six hours would repeat it.
+        # env_for() deliberately
         "LINGLING_DATA_DIR": str(data),
     })
     key = next((k for k in env if k.upper() == "PATH"), "PATH")
@@ -1122,15 +1018,7 @@ def section_launch(url):
 
 
 def section_helper_python():
-    """The helper must not be launched through a venv redirector stub.
-
-    pipx is a venv, and ``Scripts/python.exe`` there is a stub that
-    starts the real interpreter as its own child -- and the child is the
-    process that polls for the whole session, the one Windows hands a
-    fresh console. So the helper is pointed at the base interpreter,
-    while the installer argv keeps the interpreter lingling itself runs
-    on, which is what makes pip install into the right place.
-    """
+    """The helper must not be launched through a venv redirector stub"""
     print("\n=== 25. the helper runs on an interpreter that cannot flash ===")
     got = update.helper_python()
     check("the helper interpreter is a real file", pathlib.Path(got).is_file(),

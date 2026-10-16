@@ -7,20 +7,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 VERIFY = ROOT / "tools" / "verify"
-#: 45s produced FALSE "HUNG" verdicts on `first_token_grace` and
+#: 45s produced
 TIMEOUT = 240
 
-#: shipped default -> a value that would be wrong -> the suites that could see it
+#: shipped default
 MUTATIONS = (
     ({}, "control (shipped)",
      ("send_window", "reused_send", "pool_ttl", "first_token_grace",
       "cold_connect", "committed_stream", "client_stall", "idle_ceiling",
-      "window_floors")),
+      "first_content_deadline", "stall_cut", "window_floors")),
     ({"LINGLING_SEND_S": "30"}, "SEND 120->30 (the reverted value)",
      ("send_window", "reused_send")),
     ({"LINGLING_KEEPALIVE_S": "30"}, "KEEPALIVE 600->30 (below his 70s lap)",
      ("pool_ttl",)),
-    # `window_floors` is the only one of these that
+    # `window_floors`
     ({"LINGLING_FIRST_BYTE_S": "2"}, "FIRST_BYTE 30->2",
      ("first_token_grace", "cold_connect", "committed_stream",
       "window_floors")),
@@ -28,6 +28,21 @@ MUTATIONS = (
      ("committed_stream", "client_stall", "window_floors")),
     ({"LINGLING_STREAM_IDLE_S": "2"}, "IDLE 1800->2",
      ("idle_ceiling", "committed_stream", "client_stall", "window_floors")),
+    ({"LINGLING_FIRST_CONTENT_S": "2"},
+     "FIRST_CONTENT 30->2 (cuts real first tokens)",
+     ("first_content_deadline", "window_floors")),
+    ({"LINGLING_FIRST_CONTENT_S": "1800"},
+     "FIRST_CONTENT 30->1800 (nothing is ever cut)",
+     ("first_content_deadline", "window_floors")),
+    ({"LINGLING_STALL_CUT_S": "2"},
+     "STALL 120->2 (cuts live answers mid-think)",
+     ("stall_cut", "window_floors")),
+    ({"LINGLING_STALL_CUT_S": "1800"},
+     "STALL 120->1800 (a dead exit freezes agents again)",
+     ("stall_cut", "window_floors")),
+    ({"LINGLING_SWEEP_S": "0"},
+     "SWEEP 20->0 (the pool is never verified)",
+     ("exit_sweep",)),
 )
 
 
@@ -51,7 +66,7 @@ def run(suite, env):
 
 
 def main():
-    # a bare `python sweep_guards.py READ IDLE` re-runs only
+    # bare `python
     want = [a.upper() for a in sys.argv[1:]]
     results = {}
     for env, label, suites in MUTATIONS:
@@ -69,11 +84,11 @@ def main():
         results[label] = failed
 
     print("\n=== coverage map ===", flush=True)
-    base = {s for s, _ in results["control (shipped)"]}
+    base = {s for s, _ in results.get("control (shipped)", [])}
     if base:
         print(f"  control already fails {sorted(base)} -- fix before reading")
     for env, label, _ in MUTATIONS:
-        # a filtered run has no row for the
+        # filtered run
         if not env or label not in results:
             continue
         hit = sorted({s for s, _ in results[label]} - base)
