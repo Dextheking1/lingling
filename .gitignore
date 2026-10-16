@@ -9,12 +9,6 @@ data/
 !.env.example
 
 # ---------------------------------------------------------------------------
-# Agent workspace -- project memory, never commit
-# ---------------------------------------------------------------------------
-.workbuddy-ai/
-.freebuff/
-
-# ---------------------------------------------------------------------------
 # Python
 # ---------------------------------------------------------------------------
 __pycache__/
@@ -24,16 +18,6 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
-
-# ---------------------------------------------------------------------------
-# Local agent tooling (not part of Lingling)
-# ---------------------------------------------------------------------------
-.agents/
-.claude/
-.hallmark/
-# Machine-local dev scripts (hardcoded absolute paths, per-operator ports).
-/.zcode/*.ps1
-skills-lock.json
 
 # ---------------------------------------------------------------------------
 # Editors / OS
@@ -73,6 +57,3 @@ sa/
 /.muse_resp_*.txt
 /.muse_retest/
 /.nemotron_probe/
-/.zcode/plans/
-/.zcode/cache/
-/.zcode/memories/
