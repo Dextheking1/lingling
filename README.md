@@ -19,7 +19,7 @@ lingling --help        # anything after `lingling` goes to opencode untouched
 lingling uninstall     # wipe the lanes, Tor bundle and logs (keeps countries.txt)
 ```
 
-`pip uninstall lingling` removes the package only — the 18 files in
+`pip uninstall lingling` removes the package only — the 15 modules in
 site-packages. The lanes, the Tor bundle, the geoip database and the proof
 logs live in the data dir, which pip does not know exists, so a plain pip
 uninstall leaves a few hundred megabytes and a stale relay cache behind.
@@ -50,10 +50,10 @@ call failing.
 
 ```
 14:19:24  #208.1  lanes 1,2,3,5,4 {us,nl,de,at,se}  ->  muse-spark-1.3-contributor-free
-14:19:24    | #208.1 lane 5 {at} 429 exit limited 911m -- moving lanes  0.1 KB in 7.4s
+14:19:24    | #208.1 lane 5 {at} 429 free limit -- exit out until 05:30 (00:00 UTC) -- moving it  0.1 KB in 7.4s
 14:19:25    | #208.1 lane 4 {se} 200 29.7 KB in 7.7s  first 5.8s  event 7.44s
 14:19:27  * lane 5 was refused (429) -- moved to {se}
-14:19:29    | #259.1 lane 5 {ca} 429 exit limited 911m -- moving lanes  0.1 KB in 2.9s
+14:19:29    | #259.1 lane 5 {ca} 429 rate limit -- exit out 25m -- moving it  0.1 KB in 2.9s
 ```
 
 No gaslighting. If the pane says bytes are flowing through a German exit,
@@ -62,15 +62,46 @@ your tokens are flowing through a German exit. `--no-proof` if you trust us.
 
 ### How a limit dies without you noticing
 
-Four different things can go wrong, and they are kept strictly apart.
+Six different things can go wrong, and they are kept strictly apart.
 
-**The limit.** opencode's free tier is per exit IP, and a 429 means that IP
-has spent its allowance for the window. opencode tells us exactly when it
-comes back, via `retry-after` — often hours. So the lane's relay is written
-off until then, the lane is pinned to a **different** relay in the same
-country, and your request is already elsewhere. Keep hitting the limit and the
+Two 429s, and they are not the same thing. The lane is moved to another exit
+for both; what differs is which **notepad section** that exit is written into.
+
+**The day's wall (`free limit`).** opencode's free tier allows **200 requests
+a day, per exit IP, and resets at 00:00 UTC** — 05:30 IST for us. The 429
+carries the reset it means, so that relay is written into the *free limit*
+section until then, the lane is pinned to a **different** relay in the same
+country, and your request is already elsewhere. Keep hitting the wall and the
 lane changes country too; keep going and it gets re-cooked from scratch. The
-proof window names the reset it was told: `429 exit limited 146m`.
+proof window names the reset: `429 free limit -- exit out until 05:30
+(00:00 UTC) -- moving it`. A handful of reports have the wall sticking past
+midnight UTC, which is why no exit is ever written off for more than a day.
+
+**The rate limit (`rate`).** A short burst ceiling (roughly 15–20 requests a
+minute) that opencode neither documents nor puts a header on. It lifts within
+minutes, so that exit goes into the *rate limit* section for 25 minutes —
+long enough to stop re-dialling an exit we already know is cooling off:
+`429 rate limit -- exit out 25m -- moving it`.
+
+An exit that is spent is only ever the *exit's* problem, never the lane's. The
+lane moves off it, and the moment it is on a different relay its clock is
+clear again, so it is back in the race on the next call. A lane parked on a
+spent exit with its move still waiting for its own streams to finish is the one
+case the sweep picks up first: `lane 4 {se} was sitting out a spent exit --
+back on 45.137.69.13`. And a refusal is charged to the relay it actually came
+from: a copy that was already in flight when its lane moved keeps reporting on
+the exit it dialled, so a fresh relay is never written off for a wall that
+belongs to the one it replaced.
+
+When a 429 catches **every** lane at once, that wall is not passed on to your
+client yet. The refused lanes have already moved to fresh exits, so the call
+waits 2s and walks the pool again — twice — and only then does the last 429
+reach you. A pool with nothing left to move is not kept waiting at all.
+
+**Their edge, not our exit.** A 429 whose body says `Endpoint is unavailable`
+is opencode's own edge having a bad moment, so it is never written into the
+notepad at all and the pane says so loudly: `429 OPENCODE EDGE UNAVAILABLE --
+not this exit`.
 
 **Load.** How much a lane is carrying decides where it sits in the race,
 never whether it keeps serving. A loaded lane is healthy and still ours, so
@@ -87,6 +118,22 @@ would just fail twice.
 is written off on the spot — the same treatment a 429 gets — and your next
 call rides elsewhere. Your current answer is never taken away for it: that
 verdict lands after the bytes were already yours.
+
+**A stream that showed you nothing.** A call the client has seen no byte of —
+not even a first one — for 30s is dropped on the spot and its lane moved, the
+timeout verdict taken mid-stream. That is what stops a parked exit from holding
+your client, and every answer queued behind it, for the half-hour idle window.
+Nothing was delivered, so nothing is half-answered: the call retries on the
+other lanes at once. Once a byte has reached you the long window is back — an
+answer that pauses to think is never cut for it.
+
+**A stream that goes quiet.** Once an answer is flowing, a pause is a pause: a
+model thinking is not a dead exit, and cutting one costs you the rest of the
+answer. But an exit that has said nothing at all for **two minutes** is dead,
+and the stream is ended — your client is hung up, so the agent retries instead
+of waiting forever, and that exit is written off and moved. Measured
+2026-10-16: five committed streams on one exit sat at 400-460s of silence with
+agent thinking blocks frozen mid-word, while every other lane kept delivering.
 
 A Tor tunnel is end-to-end TLS, so a 429 can't be spotted in flight. Each lane
 therefore probes the upstream periodically and reports on itself, and a lane
