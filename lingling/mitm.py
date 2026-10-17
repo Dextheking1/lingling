@@ -1,4 +1,13 @@
-"""Per-request MITM for opencode.ai: a local CA terminates TLS per call."""
+"""Per-request MITM for opencode.ai: a local CA terminates TLS per call.
+
+One call goes down a wave of ``_RACE_WIDTH`` exits, not down the whole fleet.
+The free tier flags a client that turns up from half a dozen addresses for the
+same session: the 2026-10-18 live session answered 200 on every wave of five
+and was refused ``403 FreeTierError`` on every wave of ten, from that session's
+very first call -- and the refusal then stuck to the client, not to the exits.
+Ten lanes are still worth having, because they spread the day's allowance and
+give the sweep somewhere to move a lane to.  Ten copies of one call are not.
+"""
 
 from __future__ import annotations
 
@@ -33,7 +42,8 @@ _STALL_CUT_S = bounds.number("LINGLING_STALL_CUT_S", 120,
                              bounds.TICK_S, bounds.WINDOW_S)
 _PULSE_S = bounds.number("LINGLING_PULSE_S", 60,
                          bounds.TICK_S, bounds.WINDOW_S)
-_RACE_WIDTH = bounds.count("LINGLING_RACE_WIDTH", 0, 0, 64)
+#: five exits
+_RACE_WIDTH = bounds.count("LINGLING_RACE_WIDTH", 5, 0, 64)
 _SLOW_EXIT_S = bounds.number("LINGLING_SLOW_EXIT_S", 20,
                              bounds.TICK_S, bounds.WINDOW_S)
 _FIRST_EVENT = b"data:"
@@ -687,7 +697,14 @@ def handle_conn(raw: socket.socket, host: str, port: int, seq: int,
 
 def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
            emit: Callable[[Dict], None], relay) -> None:
-    """Serve model calls on one client TLS connection; a lane per call."""
+    """Serve model calls on one client TLS connection; a lane per call.
+
+    A wave where every lane answered 403 ends the call.  The refusal names the
+    client -- the free tier will not credit these requests through any address
+    -- so walking the rest of the pool on the same call is the same wall paid
+    for twice, and it is what turns one tripped call into a pool with no exits
+    left.  The far end's own 403 is the client's answer.
+    """
     cf = client.makefile("rb")
     call_n = 0
     while True:
@@ -761,6 +778,11 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
             if got.held:
                 held = got.held
             if got.committed:
+                return
+            if got.gated and len(got.gates) >= len(lanes):
+                #: wave gated
+                if held:
+                    client.sendall(held)
                 return
             if got.refused:
                 client.sendall(held)
