@@ -13,8 +13,8 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from . import bounds, netutil
-from .bench import FREE_LIMIT, RATE_LIMIT
+from . import bounds, exits, netutil
+from .bench import FREE_LIMIT, GATE_LIMIT, RATE_LIMIT
 from .lanes import Lane
 
 MITM_HOSTS = ("opencode.ai",)
@@ -41,6 +41,35 @@ _KEEPALIVE_S = bounds.number("LINGLING_KEEPALIVE_S", 600,
                              bounds.TICK_S, bounds.WINDOW_S)
 
 _RETRYABLE = frozenset({429, 502, 503, 504})
+
+#: gate refusal
+_GATE_REFUSAL = 403
+
+#: announced gates
+_GATE_TOLD: Dict[str, float] = {}
+_GATE_TOLD_LOCK = threading.Lock()
+
+
+def _gate_is_news(exit_fp: str, until: float) -> bool:
+    """True the first time this exit's closure is announced in this process.
+
+    The gate refuses in a blink, so a busy session keeps many copies of one
+    exit in flight at once, and each of them lands its own 403.  Without this
+    the pane carried one identical line per copy -- dozens in a second -- for
+    one closed exit.  The first copy speaks for the exit; the rest are the
+    same fact, already said.
+    """
+    now = time.time()
+    with _GATE_TOLD_LOCK:
+        if _GATE_TOLD.get(exit_fp, 0.0) > now:
+            return False
+        if len(_GATE_TOLD) > 256:
+            for fp, deadline in list(_GATE_TOLD.items()):
+                if deadline <= now:
+                    del _GATE_TOLD[fp]
+        _GATE_TOLD[exit_fp] = until
+        return True
+
 _5XX_ATTEMPTS = 2
 _LIMIT_WAVES = bounds.count("LINGLING_LIMIT_WAVES", 2, 0, 16)
 _LIMIT_WAIT_S = bounds.number("LINGLING_LIMIT_WAIT_S", 2.0,
@@ -278,22 +307,17 @@ def _race_lanes(relay, tried: set) -> List[Lane]:
     taken = set(tried)
     spare: Optional[Lane] = None
     same_exit: Optional[Lane] = None
-    exits: Dict[str, int] = {}
+    riders: Dict[str, int] = {}
 
     def live(lane) -> bool:
         return lane.limited_until <= now
 
-    def exit_key(lane) -> str:
-        """What the far end counts this lane's allowance against."""
-        ip = (lane.exit_ip or "").strip()
-        if ip and ip != "?":
-            return ip
-        return lane.exit_fingerprint or ""
+    exit_key = exits.exit_key
 
     def shares_an_exit(lane) -> bool:
         """True when a lane already in this wave sits on that exit."""
         key = exit_key(lane)
-        return bool(key) and key in exits
+        return bool(key) and key in riders
 
     first = _grab_lane(relay, taken)
     if first is not None and not live(first):
@@ -304,7 +328,7 @@ def _race_lanes(relay, tried: set) -> List[Lane]:
         taken.add(first.index)
         key = exit_key(first)
         if key:
-            exits[key] = first.index
+            riders[key] = first.index
     while _RACE_WIDTH <= 0 or len(lanes) < _RACE_WIDTH:
         lane = relay.pick_lane(exclude=taken)
         if lane is None or lane.index in taken:
@@ -319,7 +343,7 @@ def _race_lanes(relay, tried: set) -> List[Lane]:
         lanes.append(lane)
         key = exit_key(lane)
         if key:
-            exits[key] = lane.index
+            riders[key] = lane.index
     if same_exit is not None and (_RACE_WIDTH <= 0
                                   or len(lanes) < _RACE_WIDTH):
         lanes.append(same_exit)
@@ -425,7 +449,9 @@ class _Round:
         self.held = b""
         self.retryable = False
         self.limits: List[tuple] = []
+        self.gates: List[tuple] = []
         self.refused = False
+        self.gated = False
         self.fivexx = False
 
 
@@ -496,12 +522,42 @@ def _note_ok(relay, lane) -> None:
         note(lane.exit_fingerprint)
 
 
+def _note_spend(relay, lane) -> None:
+    """Count a landed request against the exit that carried it.
+
+    Counted against the exit's address, which is what the far end meters.
+    Only the winner is counted: a beaten copy is cut before the far end has
+    seen the whole request, so charging the day for it would overstate what we
+    have spent.  This is the ledger the picker walks past a hard-used exit on.
+    """
+    note = getattr(relay.tor, "note_spend", None)
+    if note is not None:
+        note(exits.exit_key(lane))
+
+
 def _tally(race: _Race, out: List[tuple], relay) -> _Round:
-    """Judge a race: the client's answer, or what the copies earned."""
+    """Judge a race: the client's answer, or what the copies earned.
+
+    Only a 200 takes the call.  Every copy starts at the same instant, so the
+    first 200 to arrive is also the quickest lane's 200 -- and everything that
+    is not a 200 is held back, however fast it comes.  That is the whole rule,
+    and refusing is cheaper than answering, so without it a spent exit, a
+    stalled edge or a gate refusal beats every healthy lane to the client by
+    seconds and the call dies on the cheapest answer rather than the best one.
+
+    A held answer is still a real answer: the first refusal is kept and handed
+    over when no lane can do better, so a pool with nothing left to give says
+    what the far end actually said instead of inventing a 502.  A 403 is the
+    free tier's gate and moves no lane -- the gate refused this exit, not this
+    tor -- but the exit is sat out, because racing it on every call pays for
+    the same wall again.
+    """
     got = _Round()
     for copy, (err, status, body, retryable) in out:
         if race.winner is copy:
             relay.tor.note_result(copy.lane.exit_country, status)
+            if status:
+                _note_spend(relay, copy.lane)
             if status == 200:
                 _note_ok(relay, copy.lane)
             continue
@@ -509,6 +565,13 @@ def _tally(race: _Race, out: List[tuple], relay) -> _Round:
             if copy.beaten:
                 continue
             got.retryable = got.retryable or retryable
+            continue
+        if status == _GATE_REFUSAL:
+            got.gated = True
+            got.retryable = True
+            got.gates.append((copy.lane, copy.exit_fp))
+            if not got.held:
+                got.held = body
             continue
         if status == 429:
             section, wait = _limit_of(body)
@@ -526,6 +589,12 @@ def _tally(race: _Race, out: List[tuple], relay) -> _Round:
             got.retryable = True
             if not got.held:
                 got.held = body
+            continue
+        if status:
+            got.retryable = True
+            if not got.held:
+                got.held = body
+            continue
     got.committed = race.winner is not None
     return got
 
@@ -677,6 +746,18 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
                 relay.tor.note_limited(lane, wait, section, fingerprint=exit_fp)
                 relay.report_refused(lane, 429, exit_fp)
                 _sticky_verdict(relay, lane)
+            for lane, exit_fp in got.gates:
+                until = relay.tor.note_limited(lane, 0.0, GATE_LIMIT,
+                                               fingerprint=exit_fp)
+                if not until or not _gate_is_news(exit_fp, until):
+                    continue
+                _sticky_verdict(relay, lane)
+                emit({"type": "lane", "kind": "limited", "t": time.time(),
+                      "lane": lane.index, "cc": lane.exit_country,
+                      "ip": lane.exit_ip,
+                      "msg": f"lane {lane.index} "
+                             f"{{{lane.exit_country}}} 403 -- the gate closed "
+                             f"this exit, sitting it out"})
             if got.held:
                 held = got.held
             if got.committed:
@@ -769,9 +850,17 @@ class TunnelPool:
 
 
 def _note_of(raw: bytes) -> str:
-    """The error body as one readable line, for the pane."""
-    text = " ".join(raw.decode("utf-8", "replace").split())
-    return text[:200]
+    """The error body as one readable line, for the pane.
+
+    Some exits compress their refusal, and a compressed body decodes to a line
+    of mojibake -- two hundred characters of it, on every gated call.  A body
+    that is not text says nothing here: the status and the exit already say
+    what happened, and a line the operator cannot read is worse than no line.
+    """
+    text = raw.decode("utf-8", "replace")
+    if "\ufffd" in text:
+        return ""
+    return " ".join(text.split())[:200]
 
 
 def _retry_after(rheaders: dict) -> float:
@@ -1160,7 +1249,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
         if status == 429:
             retry_after = _retry_after(rheaders)
 
-        if status not in _RETRYABLE:
+        if status == 200:
             held = None
         is_sse = b"text/event-stream" in rheaders.get(b"content-type", b"")
         want_note = status >= 400

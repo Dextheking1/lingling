@@ -34,6 +34,18 @@ RETRY = (b"HTTP/1.1 429 Too Many Requests\r\n"
          b"content-type: application/json\r\nretry-after: 120\r\n"
          b"content-length: %d\r\nconnection: close\r\n\r\n" % len(LIMITED))
 
+#: The free tier's gate, as an exit answers it: the refusal a real build saw.
+GATE = (b'{"error":"FreeTierError","message":"OpenCode\'s free tier can '
+        b'only be used from within OpenCode."}')
+GATED = (b"HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\n"
+         b"content-length: %d\r\nconnection: close\r\n\r\n" % len(GATE))
+
+#: The far end's own 500, which must not beat a slower 200 either.
+BROKEN = b'{"error":"the far end is unwell"}'
+ERROR = (b"HTTP/1.1 500 Internal Server Error\r\n"
+         b"content-type: application/json\r\n"
+         b"content-length: %d\r\nconnection: close\r\n\r\n" % len(BROKEN))
+
 
 def chunk(marker: bytes) -> bytes:
     """One SSE event, tagged with the lane that wrote it."""
@@ -88,8 +100,10 @@ class Tor:
 
     def note_limited(self, lane, retry_after=0.0, reason="rate",
                      fingerprint=""):
+        """The far end's bench, and the deadline the product hands back."""
         lane.limited_until = time.time() + (retry_after or 600)
         self.moved.append(lane.index)
+        return lane.limited_until
 
     def note_timeout(self, lane):
         self.timeouts.append(lane.index)
@@ -237,6 +251,12 @@ class Upstream:
             time.sleep(delay)
             if kind == "429":
                 c.sendall(RETRY + LIMITED)
+                return
+            if kind == "403":
+                c.sendall(GATED + GATE)
+                return
+            if kind == "500":
+                c.sendall(ERROR + BROKEN)
                 return
             c.sendall(HEAD)
             c.sendall(chunk(marker))
@@ -675,6 +695,128 @@ def main():
     check("with exactly one answer in its stream",
           bytes(client.got).count(b"data: ") == 1,
           repr(bytes(client.got[:120])))
+
+    print("\n=== 15. a gated exit answers first, and still does not take "
+          "the call ===")
+    #: The gate refuses in a blink -- refusing is cheaper than answering -- so
+    #: the lane it refused wins every race it is in unless the refusal is held
+    #: back.  A build must never see it while another lane can serve.
+    specs = [("403", 0.05, b""), ("sse", 1.0, b"lane-2"),
+             ("sse", 1.5, b"lane-3"), ("403", 0.05, b"")]
+    client, events, tor, relay, ups = serve(specs)
+    ends = [e for e in events if e.get("type") == "callend"]
+    print(f"  statuses={[e.get('status') for e in ends]}")
+    check("the lane that could serve is what the client got",
+          b"lane-2" in client.got, repr(bytes(client.got[:60])))
+    check("and the gate's refusal never reached it",
+          b"FreeTierError" not in client.got, repr(bytes(client.got[:60])))
+    check("one answer in its stream, not two",
+          bytes(client.got).count(b"data: ") == 1,
+          repr(bytes(client.got[:120])))
+    check("the gated lanes are still reported in the pane",
+          sorted(e.get("status") for e in ends) == [200, 403, 403],
+          str([e.get("status") for e in ends]))
+    said = [e.get("msg", "") for e in events if e.get("kind") == "limited"]
+    benched = [tor.lanes[i - 1].limited_until > time.time() for i in (1, 4)]
+    print(f"  benched={benched} said={said}")
+    check("the gated exits are sat out, so no call races them again",
+          all(benched) and not relay.refused,
+          f"benched={benched} refused={relay.refused}")
+    check("and the pane says which exits the gate closed",
+          len(said) == 2 and all("403" in m for m in said), str(said))
+
+    print("\n=== 16. a pool where every exit is gated still hands the "
+          "refusal over ===")
+    specs = [("403", 0.05, b"")] * 4
+    client, events, tor, relay, ups = serve(specs)
+    check("the client got the gate's own 403",
+          bytes(client.got).startswith(b"HTTP/1.1 403"),
+          repr(bytes(client.got[:40])))
+    check("one refusal, not one per lane",
+          bytes(client.got).count(b"FreeTierError") == 1,
+          repr(bytes(client.got[:200])))
+    check("no lane was dialled twice", [u.dials for u in ups] == [1] * 4,
+          str([u.dials for u in ups]))
+    check("every gated exit is sat out",
+          all(l.limited_until > time.time() for l in tor.lanes),
+          str([l.limited_until for l in tor.lanes]))
+
+    print("\n=== 17. only a 200 takes the call: the fastest answer is not "
+          "the best one ===")
+    specs = [("500", 0.05, b""), ("sse", 1.0, b"lane-2"),
+             ("sse", 1.4, b"lane-3")]
+    client, events, tor, relay, ups = serve(specs)
+    check("a 500 that answered in a blink did not take the call",
+          b"lane-2" in client.got, repr(bytes(client.got[:60])))
+    check("and the far end's error never reached the client",
+          b"HTTP/1.1 500" not in client.got, repr(bytes(client.got[:40])))
+    check("the quickest of the two 200s is the one that won -- the rule "
+          "the whole thing is for",
+          b"lane-2" in client.got and b"lane-3" not in client.got,
+          repr(bytes(client.got[:80])))
+
+    specs = [("500", 0.05, b""), ("500", 0.05, b"")]
+    client, events, tor, relay, ups = serve(specs)
+    check("a pool with no 200 at all hands the far end's own 500 over",
+          bytes(client.got).startswith(b"HTTP/1.1 500"),
+          repr(bytes(client.got[:40])))
+    check("once, verbatim, not one per lane",
+          bytes(client.got).count(b"the far end is unwell") == 1,
+          repr(bytes(client.got[:200])))
+    check("and no lane was dialled twice", [u.dials for u in ups] == [1, 1],
+          str([u.dials for u in ups]))
+
+    print("\n=== 18. one closed exit is announced once, however many calls "
+          "are in flight ===")
+    #: The live pane showed this: a dozen identical "sitting it out" lines in
+    #: one second, one per copy of the same exit already in the air.  The pane
+    #: says a fact, so one closed exit is one line.
+    tor = Tor([Lane(1), Lane(2)])
+    relay = Relay(tor)
+    #: a fingerprint no earlier section has spoken for, and a gate slow enough
+    #: that all six calls are in the air before it answers.
+    tor.lanes[0].exit_fingerprint = "GATE18" * 6 + "18"
+    ups18 = [Upstream(("403", 0.4, b"")), Upstream(("sse", 0.6, b"lane-2"))]
+    for lane, up in zip(tor.lanes, ups18):
+        lane.socks_port = up.port
+    runs, said, lock = [], [], threading.Lock()
+    ready = threading.Barrier(6)
+
+    def one() -> None:
+        client, events = Client(), []
+        ready.wait(30)
+        mitm._serve(client, "opencode.ai", 443, 1, events.append, relay)
+        with lock:
+            runs.append(client)
+            said.extend(e.get("msg", "") for e in events
+                        if e.get("kind") == "limited")
+
+    real_ctx = ssl.create_default_context
+    ssl.create_default_context = lambda *a, **k: RawCtx()
+    try:
+        threads = [threading.Thread(target=one) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+    finally:
+        ssl.create_default_context = real_ctx
+    print(f"  calls={len(runs)}  announced={len(said)}  {said[:2]}")
+    check("every call still got the lane that could serve",
+          len(runs) == 6 and all(b"lane-2" in c.got for c in runs),
+          f"calls={len(runs)}")
+    check("the closed exit is announced once, not once per call",
+          len(said) == 1, str(said))
+
+    print("\n=== 19. a compressed refusal is not printed as mojibake ===")
+    #: The live pane carried two hundred characters of it on every gated call.
+    check("a body that is not text says nothing",
+          mitm._note_of(b"\x44\xd9\x39\x4d\xff\xfe") == "",
+          repr(mitm._note_of(b"\x44\xd9\x39\x4d\xff\xfe")))
+    check("a readable one is still one line",
+          mitm._note_of(b'{"error":\n  "FreeTierError"}')
+          == '{"error": "FreeTierError"}',
+          repr(mitm._note_of(b'{"error":\n  "FreeTierError"}')))
 
     print()
     if FAILS:
