@@ -448,9 +448,14 @@ def emit(check_obj: Optional[Check], stream=None, ask: bool = False) -> None:
 
 
 def cached_hint(data_dir, stream=None) -> None:
-    """The ``--version`` line, from cache only. Never touches the net."""
+    """The ``--version`` line, from cache only. Never touches the net.
+
+    Nothing is scheduled here, so the line names the command rather than saying
+    an install is on its way: `--version` is a question, not a launch.
+    """
     stream = stream or sys.stderr
-    for line in notice_lines(read_cache(data_dir), mode_name=mode()):
+    mode_name = "off" if mode() == "off" else "notify"
+    for line in notice_lines(read_cache(data_dir), mode_name=mode_name):
         _say(stream, line)
 
 

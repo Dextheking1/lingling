@@ -639,6 +639,17 @@ def section_wiring(url):
     check("it prints the version", code == 0 and CURRENT in out,
           f"code={code} {out[:150]}")
     check("and made no request at all", not HITS, str(HITS))
+    #: nothing is scheduled by a version question, so it must not promise one
+    (data / update.CACHE_NAME).write_text(json.dumps(
+        {"latest": "9.9.9", "min_supported": None, "notice": None,
+         "url": "https://pypi.org/project/lingling/", "source": "manifest",
+         "checked_at": time.time()}), encoding="utf-8")
+    code, out = run_cli(["--version"], data, env_for(url))
+    check("a pending update is named in the version line",
+          code == 0 and "9.9.9" in out, f"code={code} {out[:150]}")
+    check("and it names the command, never a scheduled install",
+          "lingling update" in out
+          and "installs when this session ends" not in out, out[:200])
 
 
 def _visible_console_windows() -> int:
