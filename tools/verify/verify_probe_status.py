@@ -19,8 +19,13 @@ PLACEHOLDER = (b'{"model":"x","stream":false,"max_output_tokens":1,'
 BODY = _scan_body(PROBE_MODEL, PROBE_PATH)
 
 #: (model, path)
+#:
+#: The responses pair that used to head this list answered 410 ModelDeprecated
+#: on 2026-10-17 -- "Model muse-spark-1.3-contributor-free has been
+#: deprecated" -- so every probe through it stopped being a verdict and no lane
+#: was ever checked again.  A pair belongs here only while the far end still
+#: answers it.
 GOOD_PAIRS = [
-    ("muse-spark-1.3-contributor-free", "/zen/v1/responses"),
     ("mimo-v2.6-flash-free", "/zen/v1/chat/completions"),
 ]
 

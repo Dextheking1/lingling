@@ -13,10 +13,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import bounds, exits, netutil, winjob
-from .bench import USED_PATH, USED_TTL_S, VERIFIED_PATH, BenchMixin
+from .bench import (EXIT_DAY_CAP, USED_PATH, USED_TTL_S, VERIFIED_PATH,
+                    BenchMixin)
 
 Log = Callable[..., None]
 
@@ -108,6 +109,7 @@ class Lane:
     limited_until: float = 0.0
     limit_reason: str = ""
     exit_fingerprint: str = ""
+    exit_since_ts: float = 0.0
     recent_countries: List[str] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -319,6 +321,7 @@ class TorManager(BenchMixin):
         self._limited: Dict[str, Dict] = self._load_limited()
         self._used: Dict[str, float] = self._load_stamps(USED_PATH)
         self._verified: Dict[str, float] = self._load_stamps(VERIFIED_PATH)
+        self._spent: Dict[str, int] = self._load_spent()
         self.socks_base = socks_base
         self.control_base = control_base
         self.tor_exe_override = tor_exe
@@ -1015,6 +1018,7 @@ class TorManager(BenchMixin):
             shutil.rmtree(lane.data_dir, ignore_errors=True)
         lane.data_dir.mkdir(parents=True, exist_ok=True)
         lane.exit_ip = ""
+        lane.exit_since_ts = 0.0
         lane.last_circuit_built_ts = 0.0
         lane.boot_ok = False
         try:
@@ -1066,6 +1070,7 @@ class TorManager(BenchMixin):
             ctl.close()
         lane.exit_fingerprint = relay.fingerprint
         lane.exit_ip = relay.ip
+        lane.exit_since_ts = time.time()
         lane.forget_limit()
         lane.asked = False
         lane.probe_code = -1
@@ -1139,29 +1144,79 @@ class TorManager(BenchMixin):
             self._by_country = {}
         return bool(self._by_country)
 
+    def _held(self, lane: Optional[Lane] = None) -> Tuple[List[str], List[str]]:
+        """What the other lanes are holding: their exits, and their exit IPs.
+
+        The far end counts its day against the exit's address, so two relays
+        behind one address are one allowance.  A lane must not share either.
+        """
+        others = [l for l in self.lanes if l is not lane]
+        fingerprints = [l.exit_fingerprint for l in others if l.exit_fingerprint]
+        ips = [l.exit_ip for l in others if l.exit_ip and l.exit_ip != "?"]
+        return fingerprints, ips
+
+    def _headroom(self, country: str) -> int:
+        """How many exits this country can still give us today."""
+        if not self._load_exits():
+            return 0
+        fingerprints, ips = self._held()
+        return exits.headroom(self._by_country or {}, country, fingerprints,
+                              self._limited, self._spent, time.time(), ips,
+                              EXIT_DAY_CAP)
+
+    def _census(self) -> List[str]:
+        """Every country the cached consensus has an exit in, lowercased.
+
+        The configured ladder is a preference, not a cage.  Once it is spent
+        through, the hunt goes on across the whole consensus instead of
+        settling for an exit with nothing left to give.
+        """
+        if not self._load_exits():
+            return []
+        return sorted(cc.lower() for cc in (self._by_country or {}))
+
     def _pin(self, lane: Lane) -> bool:
-        """Give a lane its own relay so no two lanes share an exit."""
+        """Give a lane its own relay so no two lanes share an exit IP."""
         if not self._load_exits():
             lane.exit_fingerprint = ""
             return True
-        avoid = [l.exit_fingerprint for l in self.lanes
-                 if l is not lane and l.exit_fingerprint]
+        avoid, avoid_ip = self._held(lane)
         picked = exits.claim(self._by_country or {}, lane.exit_country,
                              avoid, self._limited, self._used, time.time(),
-                             self._verified)
+                             self._verified, self._spent, avoid_ip,
+                             EXIT_DAY_CAP)
         if picked is None:
             lane.exit_fingerprint = ""
             return False
         lane.exit_fingerprint = picked.fingerprint
         lane.exit_ip = picked.ip
+        lane.exit_since_ts = time.time()
         self._used[picked.fingerprint] = time.time() + USED_TTL_S
         self._save_stamps(USED_PATH, self._used)
         return True
 
     def rotate_exit_country(self, lane: Lane) -> Optional[str]:
-        """Move the lane to the best country that still has an exit to give."""
+        """Move the lane to the best country that still has an exit to give.
+
+        Where a country scored earlier today is the last thing consulted: the
+        first question is whether it has anything left to hand us.  Ranking by
+        who just answered 200 is how every lane ended up on the same handful of
+        countries until they were spent, all at once.  When every configured
+        country is spent the hunt widens to the whole consensus, because the
+        alternative -- an exit with nothing left, or no exit at all -- is worse
+        than the search taking longer.
+
+        A pool we know is spent and a pool we cannot see are different things:
+        a lane is only left to tor's own choosing when this machine knows of no
+        relays at all.  With a consensus in hand and nothing left in it, the
+        answer is None -- no move -- and the sweep comes back to try again.
+        Every country that comes up empty leaves the lane exactly as it found
+        it, pin and fingerprint both, so the bookkeeping never claims a move
+        that tor was never asked to make.
+        """
         leaving = lane.exit_country
-        ladders = (self._preferred, self._quiet, self._fallback, self._expand)
+        ladders = (self._preferred, self._quiet, self._fallback, self._expand,
+                   self._census())
         others = {l.exit_country for l in self.lanes if l is not lane}
         for exhausted in (False, True):
             if exhausted:
@@ -1172,15 +1227,20 @@ class TorManager(BenchMixin):
                         [c for c in dict.fromkeys(pool)
                          if c and c != leaving
                          and c not in lane.recent_countries],
-                        key=lambda c: -self._score.get(c, 0))
+                        key=lambda c: (-self._headroom(c),
+                                       -self._score.get(c, 0)))
                     for cc in ranked:
                         if spread and cc in others:
                             continue
+                        was = (lane.exit_country, lane.exit_fingerprint)
                         lane.exit_country = cc
                         if self._pin(lane):
                             lane.recent_countries.append(cc)
                             del lane.recent_countries[:-_ROTATION_MEMORY]
                             return cc
+                        lane.exit_country, lane.exit_fingerprint = was
+        if self._census():
+            return None
         lane.exit_country = "*"
         lane.exit_fingerprint = ""
         return "*"
@@ -1198,7 +1258,8 @@ class TorManager(BenchMixin):
         """Relays in one country worth asking. Empty until a consensus caches."""
         if not self._load_exits():
             return []
-        avoid = [l.exit_fingerprint for l in self.lanes if l.exit_fingerprint]
+        avoid, avoid_ip = self._held()
         return exits.sweep_order(self._by_country or {}, country, avoid,
                                  self._limited, self._used, self._verified,
-                                 time.time())
+                                 time.time(), self._spent, avoid_ip,
+                                 EXIT_DAY_CAP)

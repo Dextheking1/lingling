@@ -6,10 +6,10 @@ import json
 import os
 import threading
 import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
-from . import bounds, netutil
-from .bench import FREE_LIMIT, RATE_LIMIT
+from . import bounds, exits, netutil
+from .bench import EXIT_HOLD_S, EXIT_SOFT_CAP, FREE_LIMIT, RATE_LIMIT
 from .lanes import Lane, TorManager
 
 UPSTREAM_HOST = "opencode.ai"
@@ -17,8 +17,8 @@ UPSTREAM_PROBE_PATH = "/zen/v1/models"
 UPSTREAM_MODEL_PATH = "/zen/v1/responses"
 UPSTREAM_CHAT_PATH = "/zen/v1/chat/completions"
 PROBE_MODEL = os.environ.get("LINGLING_PROBE_MODEL",
-                             "muse-spark-1.3-contributor-free")
-PROBE_PATH = os.environ.get("LINGLING_PROBE_PATH", UPSTREAM_MODEL_PATH)
+                             "mimo-v2.6-flash-free")
+PROBE_PATH = os.environ.get("LINGLING_PROBE_PATH", UPSTREAM_CHAT_PATH)
 
 
 def _scan_body(model: str, path: str = UPSTREAM_MODEL_PATH) -> bytes:
@@ -36,6 +36,8 @@ UPSTREAM_UA = os.environ.get("LINGLING_UPSTREAM_USER_AGENT", "opencode/1.0")
 PROBE_TIMEOUT = 15.0
 
 SWEEP_S = bounds.number("LINGLING_SWEEP_S", 20, 0.0, bounds.WINDOW_S)
+
+SWEEP_MOVES = bounds.count("LINGLING_SWEEP_MOVES", 3, 1, 64)
 
 PROBE_VERDICTS = (200, 403, 429)
 
@@ -113,6 +115,9 @@ class HealthDaemon:
                 return 0
             lane.probe_reason = (FREE_LIMIT if netutil.QUOTA_SPENT in body
                                  else RATE_LIMIT)
+        if code == 410:
+            lane.probe_note = ("probe model retired"
+                               if b"ModelDeprecated" in body else "gone")
         try:
             c2, body = netutil.https_get_via_socks(
                 lane.socks_port, "check.torproject.org", "/api/ip",
@@ -198,10 +203,16 @@ class HealthDaemon:
             return
         moved = self.tor.rotate_exit_country(lane)
         if self.tor.restart_lane(lane):
-            self._emit_lane(
-                lane, "limited",
-                f"lane {lane.index} was refused ({status}) -- moved to "
-                f"{{{moved or lane.exit_country}}}")
+            if moved:
+                self._emit_lane(
+                    lane, "limited",
+                    f"lane {lane.index} was refused ({status}) -- moved to "
+                    f"{{{moved}}}")
+            else:
+                self._emit_lane(
+                    lane, "limited",
+                    f"lane {lane.index} was refused ({status}) and nothing has "
+                    f"room left -- keeping its own exit, retrying")
 
     def _revive(self, lane: Lane) -> None:
         """Bring a down lane back, and say so either way."""
@@ -261,30 +272,110 @@ class ExitSweep:
             self._stop.wait(self.interval)
 
     def step(self) -> None:
-        """Move one idle lane onto the freshest exit its country can give.
+        """Move idle lanes onto the freshest exits their countries can give.
 
         A lane that is sitting out a spent exit goes first: that is the pool
         coming back, and it costs nothing to ask a lane that is carrying
-        nothing to re-pin itself.  A move that fails is not a reason to stop,
-        so the next idle lane gets its turn -- otherwise one lane whose tor
-        will not co-operate would hold every other lane's rescue behind it.
+        nothing to re-pin itself.  A lane whose exit we have already leaned on
+        hard comes next, and that one is the whole point of the ledger: leave
+        an exit while it still has something in hand rather than sitting on it
+        until it walls, which is how one exit ends up carrying a whole session
+        and then taking every lane down with it.  A lane that has simply been
+        riding one address the longest comes third, because nobody else's spend
+        shows up in any ledger of ours, so time on an exit is the only other
+        warning there is.  A move that fails is not a reason to stop, so the
+        next idle lane gets its turn -- otherwise one lane whose tor will not
+        co-operate would hold every other lane's rescue behind it.
+
+        A few lanes move per cycle rather than one: only idle lanes are ever
+        asked, so a sweep that moves one lane per cycle needs ten cycles to
+        turn a ten-lane fleet over, and a lane waiting its turn is a lane still
+        sitting on an address other people are spending.
         """
         if self.interval <= 0:
             return
-        idle = self.tor.idle_lanes()
         now = time.time()
+        idle = self.tor.idle_lanes()
+        riding = {id(l): self._riding_for(l) for l in idle}
         benched = [l for l in idle if l.limited_until > now]
-        for lane in benched + [l for l in idle if l.limited_until <= now]:
-            if self._reaim(lane, lane.limited_until > now):
-                return
+        worn = [l for l in idle
+                if l.limited_until <= now
+                and self._carried(l) >= EXIT_SOFT_CAP]
+        held = sorted((l for l in idle
+                       if l.limited_until <= now
+                       and riding[id(l)] >= EXIT_HOLD_S),
+                      key=lambda l: riding[id(l)], reverse=True)
+        queue: List[Tuple[Lane, str]] = []
+        seen = set()
+        for lane, reason in ([(l, "sitting out") for l in benched]
+                             + [(l, "worn") for l in worn]
+                             + [(l, "held") for l in held]
+                             + [(l, "") for l in idle if l.limited_until <= now]):
+            if id(lane) in seen:
+                continue
+            seen.add(id(lane))
+            queue.append((lane, reason))
+        moved = 0
+        for lane, reason in queue:
+            if self._reaim(lane, reason):
+                moved += 1
+                if moved >= SWEEP_MOVES:
+                    return
 
-    def _reaim(self, lane: Lane, sitting_out: bool = False) -> bool:
-        """Move one lane to another exit in its own country, if it has one."""
+    def _riding_for(self, lane: Lane) -> float:
+        """How long this lane has ridden the exit it names, -1 when unknown.
+
+        The clock is the pin, not the boot.  A lane moved onto another relay
+        without a restart rides the new one the moment tor answers, and a
+        window measured from the boot would call that exit old on the way in,
+        which is a lane that never stops moving.
+        """
+        if EXIT_HOLD_S <= 0:
+            return -1.0
+        since = getattr(lane, "exit_since_ts", 0.0)
+        if not since:
+            return -1.0
+        return max(0.0, time.time() - since)
+
+    def _carried(self, where) -> int:
+        """How much of its day one exit has carried, 0 when nothing counts.
+
+        A lane or a relay may be handed in, and the ledger is keyed the way
+        the far end meters it.  A tor that keeps no ledger -- a stand-in in a
+        test, the paths that only ever ask a lane directly -- reports nothing
+        worn, which is the old behaviour exactly.
+        """
+        spent_of = getattr(self.tor, "spent_of", None)
+        if spent_of is None:
+            return 0
+        key = exits.exit_key(where)
+        if not key:
+            return 0
+        try:
+            return int(spent_of(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _reaim(self, lane: Lane, reason: str = "") -> bool:
+        """Move one lane to another exit in its own country, if it has one.
+
+        A lane whose exit is already hard used stays where it is when the
+        freshest exit its country can offer is no fresher than the one it
+        rides: that move would cost a circuit and buy nothing.  A lane that is
+        only out of time is a different case -- the address it holds is the one
+        other people have had longest to spend -- so it takes any other exit
+        its country has, fresher or not.
+        """
         candidates = self.tor.sweep_candidates(lane.exit_country)
         if not candidates:
             return False
         target = candidates[0]
         if target.fingerprint == lane.exit_fingerprint:
+            return False
+        carried = self._carried(lane)
+        ridden = self._riding_for(lane)
+        if (carried >= EXIT_SOFT_CAP and reason != "sitting out"
+                and self._carried(target) >= carried):
             return False
         lane.healing = True
         try:
@@ -293,10 +384,20 @@ class ExitSweep:
             lane.healing = False
         if not moved:
             return False
-        said = (f"lane {lane.index} {{{lane.exit_country}}} was sitting out a "
-                f"spent exit -- back on {target.ip}" if sitting_out
-                else f"lane {lane.index} {{{lane.exit_country}}} spread to "
-                     f"exit {target.ip}")
+        if reason == "sitting out":
+            said = (f"lane {lane.index} {{{lane.exit_country}}} was sitting out "
+                    f"a spent exit -- back on {target.ip}")
+        elif reason == "worn":
+            said = (f"lane {lane.index} {{{lane.exit_country}}} had carried "
+                    f"{carried} requests on its exit -- moved on to "
+                    f"{target.ip}")
+        elif reason == "held":
+            said = (f"lane {lane.index} {{{lane.exit_country}}} had ridden its "
+                    f"exit for {ridden / 60:.0f} min -- moved on to "
+                    f"{target.ip}")
+        else:
+            said = (f"lane {lane.index} {{{lane.exit_country}}} spread to "
+                    f"exit {target.ip}")
         self._say(lane, "spread", said)
         return True
 

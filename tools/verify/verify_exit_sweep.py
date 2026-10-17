@@ -11,7 +11,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from lingling import bench, exits, health  # noqa: E402
-from lingling.cli import DATA_DIR, load_countries  # noqa: E402
+from lingling.cli import (DATA_DIR, DEFAULT_LANES, _lane_count,  # noqa: E402
+                          load_countries)
 from lingling.lanes import Lane, TorManager  # noqa: E402
 from lingling.mitm import _Copy, _Race, _tally  # noqa: E402
 
@@ -218,7 +219,11 @@ class FakeTor:
         self.healing_at_move.append(lane.healing)
         self.moved_lanes.append(lane.index)
         self.moves.append(candidate.fingerprint)
-        return lane.index not in self.stuck
+        if lane.index in self.stuck:
+            return False
+        lane.exit_fingerprint = candidate.fingerprint
+        lane.exit_ip = candidate.ip
+        return True
 
 
 pair = [relay("J" * 40, "7.7.7.7"), relay("K" * 40, "8.8.8.8")]
@@ -419,6 +424,69 @@ check("with the lane back in service either way",
       f"{benched.healing} {other.healing}")
 
 
+print("\n=== M. the fleet cycles on a clock, and a few lanes at a time ===")
+#: Time on one address is the only warning we ever get about other people's
+#: spend -- a request that was never ours appears in no ledger of ours -- so a
+#: lane that has been riding the same exit longest goes before one that has
+#: just landed, and a fleet of ten needs more than one move per cycle.
+check("a lane leaves its exit with half the day's allowance unspent",
+      0 < bench.EXIT_SOFT_CAP <= bench.EXIT_DAY_CAP // 2,
+      f"soft={bench.EXIT_SOFT_CAP} day={bench.EXIT_DAY_CAP}")
+check("there is a window for the spend we cannot see",
+      bench.EXIT_HOLD_S > 0, str(bench.EXIT_HOLD_S))
+check("and the sweep takes several lanes per cycle", health.SWEEP_MOVES >= 2,
+      str(health.SWEEP_MOVES))
+check("the shipped fleet is ten lanes", DEFAULT_LANES == 10,
+      str(DEFAULT_LANES))
+check("and the CLI takes a hand-set ten", _lane_count("10") == 10,
+      str(_lane_count("10")))
+
+clock_pool = [relay("J" * 40, "7.7.7.7"), relay("K" * 40, "8.8.8.8")]
+long_rider = lane_at(SCRATCH / "clock", "M" * 40, "de")
+long_rider.exit_since_ts = time.time() - 3600
+just_landed = lane_at(SCRATCH / "clock", "N" * 40, "de")
+just_landed.index = 2
+just_landed.exit_since_ts = time.time()
+events = []
+tor = FakeTor([just_landed, long_rider], clock_pool)
+health.ExitSweep(tor, event=events.append).step()
+check("the lane that has ridden longest moves first",
+      tor.moved_lanes[:1] == [1], str(tor.moved_lanes))
+check("and the pane says how long it had been there",
+      any("min" in e.get("msg", "") for e in events), str(events))
+check("a lane that has never pinned an exit has no clock",
+      health.ExitSweep(FakeTor([], []))._riding_for(long_rider) >= 0
+      and health.ExitSweep(FakeTor([], []))._riding_for(
+          lane_at(SCRATCH / "clock", "P" * 40)) == -1.0,
+      "an exit we never named read as a time")
+
+fleet = []
+for i in range(health.SWEEP_MOVES + 1):
+    spare = lane_at(SCRATCH / "fleet", chr(ord("M") + i) * 40, "de")
+    spare.index = i + 1
+    fleet.append(spare)
+tor = FakeTor(fleet, clock_pool)
+health.ExitSweep(tor).step()
+check("one cycle moves the budget, not the whole fleet",
+      len(tor.moved_lanes) == health.SWEEP_MOVES,
+      f"{len(tor.moved_lanes)} of {len(fleet)} moved")
+health.ExitSweep(tor).step()
+check("and the next cycle takes the lane left behind",
+      len(tor.moved_lanes) == len(fleet), str(tor.moved_lanes))
+
+clock_root = SCRATCH / "clockmove"
+(clock_root / "tools" / "data").mkdir(parents=True, exist_ok=True)
+(clock_root / "tools" / "data" / "geoip").write_text("", encoding="utf-8")
+mgr = manager(clock_root)
+moved_lane = mgr.lanes[0]
+moved_lane.exit_since_ts = time.time() - 7200
+mgr._control = lambda l: FakeCtl()
+check("the move lands", mgr.move_exit(moved_lane, relay("R" * 40, "9.9.9.9")),
+      "move_exit refused")
+check("and the lane's clock starts again on the new exit",
+      time.time() - moved_lane.exit_since_ts < 5, f"{moved_lane.exit_since_ts}")
+
+
 def live_session():
     """True when a lingling or opencode process is already running."""
     import subprocess
@@ -463,8 +531,12 @@ def live():
         check("the lane answers", code in (200, 403),
               f"the probe got {code or 'nothing'}")
         before = (lane.exit_fingerprint, lane.exit_ip)
+        before_ts = lane.exit_since_ts
         print(f"  before: {before[0][:12]} {before[1]}")
         sweeper.step()
+        check("the lane's clock on its exit starts at the pin",
+              lane.exit_since_ts > before_ts,
+              f"{before_ts} -> {lane.exit_since_ts}")
         moved = (lane.exit_fingerprint, lane.exit_ip)
         print(f"  after : {moved[0][:12]} {moved[1]}")
         check("the sweep moved the lane to another relay",

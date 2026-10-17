@@ -1,10 +1,21 @@
-"""Exit relays: pick distinct, country-filtered exits and pin them."""
+"""Exit relays: pick distinct, country-filtered exits and pin them.
+
+One country holds more exits than one lane could ever use, and the far end
+counts its day against the exit's address, so the head of a pool is the most
+contested ground in it.  A pick therefore draws a random handful of what is
+open and takes the best of those: bandwidth still counts, it just stops being
+the only thing that does.
+"""
 from __future__ import annotations
 
 import ipaddress
 import pathlib
 import random
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
+
+from . import bounds
+
+EXIT_SAMPLE_K = bounds.count("LINGLING_EXIT_SAMPLE", 12, 1, 4096)
 
 WORLD_CC = frozenset([
     "us", "de", "nl", "fr", "se", "ch", "at", "ca", "gb", "ro",
@@ -21,6 +32,22 @@ class Exit(NamedTuple):
     ip: str
     nickname: str
     bandwidth: int
+
+
+def exit_key(where: Any) -> str:
+    """What the far end counts an allowance against: the exit's address.
+
+    A lane or a relay may be handed in, and the address is only unknown until
+    the lane has been probed -- so a relay with no address yet is keyed by
+    itself.  Two relays behind one address are one allowance, which is why the
+    address is the key and the fingerprint is not.
+    """
+    ip = str(getattr(where, "exit_ip", "") or getattr(where, "ip", "")
+             or "").strip()
+    if ip and ip != "?":
+        return ip
+    return str(getattr(where, "exit_fingerprint", "")
+               or getattr(where, "fingerprint", "") or "")
 
 
 def random_countries(n: int,
@@ -114,37 +141,116 @@ def limited_until(entry: Any) -> float:
         return 0.0
 
 
+def _spent_for(exit_: Exit, spent: Dict[str, int]) -> int:
+    """What the day has spent on a relay, under either name it was booked by.
+
+    A lane carries its address only once it has been probed, so a request made
+    before that sits on the books under the relay's own fingerprint.
+    """
+    return spent.get(exit_key(exit_), 0) or spent.get(exit_.fingerprint, 0)
+
+
+def _benched(exit_: Exit, limited: Dict[str, Any], now: float) -> bool:
+    """True when nothing more can be had on this exit today.
+
+    The far end meters the address, so a wall met behind one relay is a wall
+    for every relay sharing that address -- and a relay booked under its own
+    fingerprint is asked about under either name.
+    """
+    key = exit_key(exit_)
+    if key and limited_until(limited.get(key, 0.0)) > now:
+        return True
+    return limited_until(limited.get(exit_.fingerprint, 0.0)) > now
+
+
+def _has_room(exit_: Exit, spent: Dict[str, int], cap: int) -> bool:
+    """True while the day's allowance on this exit is not yet used up."""
+    return not cap or _spent_for(exit_, spent) < cap
+
+
 def _open(relays: Sequence[Exit], avoid: Sequence[str],
-          limited: Dict[str, Any], now: float) -> List[Exit]:
-    """The relays no lane holds, and nothing has written off."""
+          limited: Dict[str, Any], now: float,
+          avoid_ip: Sequence[str] = (),
+          spent: Optional[Dict[str, int]] = None, cap: int = 0) -> List[Exit]:
+    """Only the relays still worth asking, and never one that is spent.
+
+    Held by another lane, behind an address another lane rides, written off by
+    the notepad, or already carried to the day's cap: none of those can serve
+    a request, so none of them is handed out.  What is left is what a lane may
+    be moved onto -- and if nothing is left, the answer is nothing, not a
+    spent exit.
+    """
     held = set(avoid)
+    shared = {ip for ip in avoid_ip if ip}
+    book = spent or {}
     return [e for e in relays
             if e.fingerprint not in held
-            and limited_until(limited.get(e.fingerprint, 0.0)) <= now]
+            and e.ip not in shared
+            and not _benched(e, limited, now)
+            and _has_room(e, book, cap)]
 
 
 def claim(by_country: Dict[str, List[Exit]], country: str,
           avoid: Sequence[str], limited: Dict[str, Any],
           used: Dict[str, float], now: float,
-          verified: Optional[Dict[str, float]] = None) -> Optional[Exit]:
-    """A relay in ``country`` that no lane holds and nothing has limited."""
+          verified: Optional[Dict[str, float]] = None,
+          spent: Optional[Dict[str, int]] = None,
+          avoid_ip: Sequence[str] = (),
+          cap: int = 0,
+          sample: int = EXIT_SAMPLE_K) -> Optional[Exit]:
+    """The exit in ``country`` with the most left, or None when there is none.
+
+    Never a spent one: a lane put on an exit the far end has already refused
+    spends its first real call finding out, and that call is gone.  One
+    country can hold a thousand exits, and taking its head every time is how
+    a handful of well-published relays end up carrying a whole session while
+    the rest of the consensus sits idle -- and those same relays are the ones every other
+    user of the pool is leaning on too.  So a wide pool is drawn down to a
+    random handful first, and the least spent of that handful wins: bandwidth
+    still counts, it just stops being the only thing that does.
+    """
     fresh = verified or {}
-    pool = _open(by_country.get(country.upper(), ()), avoid, limited, now)
+    book = spent or {}
+    pool = _open(by_country.get(country.upper(), ()), avoid, limited, now,
+                 avoid_ip, book, cap)
     if not pool:
         return None
-    pool.sort(key=lambda e: (0 if fresh.get(e.fingerprint, 0.0) > now else 1,
-                             used.get(e.fingerprint, 0.0), -e.bandwidth))
+    if sample and len(pool) > sample:
+        pool = random.sample(pool, sample)
+    pool.sort(key=lambda e: (
+        _spent_for(e, book),
+        0 if fresh.get(e.fingerprint, 0.0) > now else 1,
+        used.get(e.fingerprint, 0.0),
+        -e.bandwidth))
     return pool[0]
 
 
 def sweep_order(by_country: Dict[str, List[Exit]], country: str,
                 avoid: Sequence[str], limited: Dict[str, Any],
                 used: Dict[str, float], verified: Dict[str, float],
-                now: float) -> List[Exit]:
-    """Relays in ``country`` worth rotating onto, a verified one first."""
-    pool = _open(by_country.get(country.upper(), ()), avoid, limited, now)
+                now: float, spent: Optional[Dict[str, int]] = None,
+                avoid_ip: Sequence[str] = (),
+                cap: int = 0) -> List[Exit]:
+    """Relays in ``country`` still worth rotating onto, freshest first."""
+    book = spent or {}
+    pool = _open(by_country.get(country.upper(), ()), avoid, limited, now,
+                 avoid_ip, book, cap)
     return sorted(pool,
-                  key=lambda e: (0 if verified.get(e.fingerprint, 0.0) > now
+                  key=lambda e: (_spent_for(e, book),
+                                  0 if verified.get(e.fingerprint, 0.0) > now
                                   else 1,
                                   used.get(e.fingerprint, 0.0),
                                   random.random()))
+
+
+def headroom(by_country: Dict[str, List[Exit]], country: str,
+             avoid: Sequence[str], limited: Dict[str, Any],
+             spent: Optional[Dict[str, int]], now: float,
+             avoid_ip: Sequence[str] = (), cap: int = 0) -> int:
+    """How many exits ``country`` can still serve us today.
+
+    A country whose exits are all spent is a country to stop rotating into,
+    however well it scored earlier in the day.
+    """
+    return len(_open(by_country.get(country.upper(), ()), avoid, limited, now,
+                     avoid_ip, spent or {}, cap))

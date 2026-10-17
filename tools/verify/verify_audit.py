@@ -538,12 +538,14 @@ def main():
           f"PROBE_MODEL={model!r} is a placeholder, so every probe "
           f"would return 401")
     # model
+    #: measured 2026-10-17
     check("the probe's model and path are a known-good pair",
-          (PROBE_MODEL, PROBE_PATH) in (
-              ("muse-spark-1.3-contributor-free", "/zen/v1/responses"),
-              ("mimo-v2.6-flash-free", "/zen/v1/chat/completions")),
-          f"({PROBE_MODEL!r}, {PROBE_PATH!r}) is not a pair that was measured "
-          f"to answer a verdict -- it will get a 500")
+          (PROBE_MODEL, PROBE_PATH) == (
+              "mimo-v2.6-flash-free", "/zen/v1/chat/completions"),
+          f"({PROBE_MODEL!r}, {PROBE_PATH!r}) is not the pair measured to "
+          f"answer a verdict -- the responses pair it replaced answers 410 "
+          f"ModelDeprecated, so every probe is a non-verdict and no lane is "
+          f"ever checked")
 
     print("\n=== reachable() hands back the far end's status ===")
     # Every other
@@ -665,6 +667,8 @@ def main():
                   "verify_server_proxy",
                   # the next race
                   "verify_exit_sweep",
+                  # the pick
+                  "verify_exit_spread",
                   # pip cannot
                   "verify_uninstall"):
         path = ROOT / "tools" / "verify" / f"{suite}.py"

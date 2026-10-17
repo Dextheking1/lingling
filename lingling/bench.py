@@ -1,4 +1,15 @@
-"""The limit bench: what a limited exit earned, and how long it sits out."""
+"""The limit bench: what a limited exit earned, and how long it sits out.
+
+Two ledgers live here, both keyed to the 00:00 UTC the free tier resets on.
+The notepad holds what an exit was benched for.  The spend ledger holds how
+much of that day we have put through each exit ourselves, which is what lets a
+lane walk past an exit we have leaned on -- and off a wall we would otherwise
+only meet by hitting it.  ``EXIT_DAY_CAP`` is that day's observed allowance
+for one exit IP; ``EXIT_SOFT_CAP`` is how much of it one lane may lean on one
+exit before the sweep moves on, and ``EXIT_HOLD_S`` is the other reason to
+leave: an address is only as fresh as the last person who spent it, so a lane
+that has ridden one for a long time gives up more than it gains by staying.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +26,9 @@ _LIMIT_CEILING_S = 24 * 3600 + 300
 FREE_LIMIT = "free"
 RATE_LIMIT = "rate"
 
+#: gate closed
+GATE_LIMIT = "gate"
+
 LIMITED_PATH = "limited-exits.json"
 
 USED_PATH = "used-exits.json"
@@ -23,11 +37,26 @@ SCORE_PATH = "country-scores.json"
 
 VERIFIED_PATH = "verified-exits.json"
 
+SPENT_PATH = "exit-spend.json"
+
 USED_TTL_S = bounds.number("LINGLING_FRESH_S", 86400,
                            0.0, 30 * bounds.WINDOW_S)
 
 VERIFIED_TTL_S = bounds.number("LINGLING_VERIFIED_S", 1800,
                                0.0, 30 * bounds.WINDOW_S)
+
+EXIT_DAY_CAP = bounds.count("LINGLING_EXIT_CAP", 200, 1, 1000000)
+
+EXIT_SOFT_CAP = bounds.count("LINGLING_EXIT_SOFT_CAP",
+                             EXIT_DAY_CAP // 2, 1, 1000000)
+
+EXIT_HOLD_S = bounds.number("LINGLING_EXIT_HOLD_S", 600, 0.0, bounds.WINDOW_S)
+
+
+def day_of(now: Optional[float] = None) -> int:
+    """Which free-tier day ``now`` falls in: the 00:00 UTC that owns it."""
+    moment = time.time() if now is None else now
+    return int(moment // 86400)
 
 
 def next_free_reset(now: Optional[float] = None) -> float:
@@ -51,14 +80,68 @@ def bench_span(reason: str, retry_after: float = 0.0,
 class BenchMixin:
     """Held by a lane manager: reads ``self.root``, carries the ledgers.
 
-    ``self._score``, ``self._limited``, ``self._used`` and ``self._verified``
-    are filled in by the owner's constructor. Every write is best effort:
-    bookkeeping never breaks a run.
+    ``self._score``, ``self._limited``, ``self._used``, ``self._verified`` and
+    ``self._spent`` are filled in by the owner's constructor. Every write is
+    best effort: bookkeeping never breaks a run.
     """
 
     def score_of(self, country: str) -> int:
         """How this country has actually done: 200s minus everything else."""
         return self._score.get(country, 0)
+
+    def spent_of(self, key: str) -> int:
+        """How many requests we have put through one exit today."""
+        return self._spent.get(key, 0)
+
+    def note_spend(self, key: str) -> None:
+        """Count one landed request against the exit that carried it.
+
+        ``key`` is the exit as the far end meters it, which is its address
+        rather than its relay: an exit IP is shared ground, so counting what we
+        ourselves have put through it is what lets the picker walk past an exit
+        we have been leaning on and onto one nobody has touched yet -- the
+        alternative is arriving at the wall and only then finding out.
+        """
+        if not key:
+            return
+        self._roll_spent()
+        self._spent[key] = self._spent.get(key, 0) + 1
+        self._save_spent()
+
+    def _roll_spent(self) -> None:
+        """A new 00:00 UTC empties the ledger: the far end's day starts over."""
+        day = day_of()
+        if getattr(self, "_spent_day", None) != day:
+            self._spent = {}
+            self._spent_day = day
+
+    def _load_spent(self) -> Dict[str, int]:
+        """Today's ``{exit: requests}``; another day's ledger is dropped."""
+        self._spent_day = day_of()
+        raw = self._read_json(SPENT_PATH)
+        if not isinstance(raw, dict):
+            return {}
+        try:
+            if int(raw.get("day", -1)) != self._spent_day:
+                return {}
+        except (TypeError, ValueError):
+            return {}
+        counts = raw.get("spent")
+        if not isinstance(counts, dict):
+            return {}
+        out: Dict[str, int] = {}
+        for fp, seen in counts.items():
+            try:
+                out[str(fp)] = max(0, int(seen))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _save_spent(self) -> None:
+        """Best effort: persist the day's per-exit counts, with their day."""
+        self._write_json(SPENT_PATH,
+                         {"day": getattr(self, "_spent_day", day_of()),
+                          "spent": self._spent})
 
     def note_result(self, country: str, status: int) -> None:
         """Score a country by what the EXIT did: a 200, or a 429."""

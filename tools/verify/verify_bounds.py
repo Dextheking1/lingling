@@ -97,9 +97,13 @@ def main() -> int:
           out.splitlines()[-1] == "64", out)
     check("and it says the number is too big",
           "above 64" in out and "99999" in out, out)
-    out = probe({}, "from lingling import cli; print(cli._lane_count('abc'))")
+    #: the fallback is the shipped default, whichever number that is today
+    out = probe({}, "from lingling import cli; print(cli._lane_count('abc'));"
+                    " print(cli.DEFAULT_LANES)")
+    lines = out.splitlines()
     check("--lanes abc is refused, not ignored",
-          out.splitlines()[-1] == "5" and "not a number" in out, out)
+          len(lines) >= 2 and lines[-1] == lines[-2] and "not a number" in out,
+          out)
     out = probe({}, "from lingling import cli; print(cli._lane_count('3'))")
     check("--lanes 3 is taken as asked", out.splitlines()[-1] == "3", out)
 
