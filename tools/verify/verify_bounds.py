@@ -47,7 +47,7 @@ def main() -> int:
     out = knob({"LINGLING_SEND_S": "999999999"}, "m._SEND_TIMEOUT")
     check("a timeout over a day is held at a day", out == "86400.0", out)
     check("a count over its ceiling is held",
-          knob({"LINGLING_SOCKS_SLOTS": "1000"}, "m._RACE_WIDTH") in ("0", "0.0"),
+          knob({"LINGLING_SOCKS_SLOTS": "1000"}, "m._RACE_WIDTH") in ("5", "5.0"),
           "the wrong knob moved")
     both = probe({"LINGLING_SEND_S": "999999999"},
                  "import lingling.mitm, lingling.bounds as b; print(b.notes)")

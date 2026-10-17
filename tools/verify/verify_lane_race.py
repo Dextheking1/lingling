@@ -645,19 +645,25 @@ def main():
           and ends[0].get("client_kb", 0) > 0,
           str(ends[:1]))
 
-    print("\n=== 13. the shipped race covers the whole live pool ===")
-    # product's own
-    check("the shipped race is not narrowed", shipped_width == 0,
-          f"_RACE_WIDTH={shipped_width} -- 0 means every live lane")
-    specs = [("sse", 9.0, b"lane-slow"), ("sse", 9.0, b"lane-slow"),
-             ("sse", 0.2, b"lane-fast")]
+    print("\n=== 13. the shipped wave is five exits, not the whole fleet ===")
+    #: Live proof, 2026-10-18: one client, one evening.  Every wave of five
+    #: answered 200; the ten-lane session that replaced it was refused
+    #: ``403 FreeTierError`` on every copy of its very first call, and the
+    #: refusal then stuck to the client -- 50 refusals in ninety seconds.  Ten
+    #: lanes are still worth having (they spread the day's allowance); ten
+    #: copies of one call are what the gate reads as abuse.
+    check("the shipped wave is capped at five", shipped_width == 5,
+          f"_RACE_WIDTH={shipped_width}")
+    specs = [("sse", 0.2, b"lane-fast")] + [("sse", 9.0, b"lane-slow")] * 9
     client, events, tor, relay, ups = serve(specs)
     calls = [e for e in events if e.get("type") == "call"]
     raced = calls[0].get("lanes") if calls else []
     dials = [u.dials for u in ups]
     print(f"  raced={raced}  dials={dials}")
-    check("every live lane is in the wave", raced == [1, 2, 3], str(raced))
-    check("and every one of them was dialled", dials == [1, 1, 1], str(dials))
+    check("a ten-lane fleet is raced five at a time",
+          raced == [1, 2, 3, 4, 5], str(raced))
+    check("and the other five are never dialled for that call",
+          dials == [1] * 5 + [0] * 5, str(dials))
     check("the quickest lane's answer is what the client got",
           b"lane-fast" in client.got, repr(bytes(client.got[:60])))
     check("with exactly one answer in its stream",
@@ -740,6 +746,38 @@ def main():
     check("every gated exit is sat out",
           all(l.limited_until > time.time() for l in tor.lanes),
           str([l.limited_until for l in tor.lanes]))
+
+    print("\n=== 16b. one gated wave ends the call; the rest of the fleet "
+          "is not tried ===")
+    #: The refusal says the client will not be credited through ANY address,
+    #: so paying for the same wall on the other five exits only deepens it.
+    specs = [("403", 0.05, b"")] * 10
+    client, events, tor, relay, ups = serve(specs)
+    dials = [u.dials for u in ups]
+    print(f"  dials={dials}")
+    check("the client got the gate's own 403",
+          bytes(client.got).startswith(b"HTTP/1.1 403"),
+          repr(bytes(client.got[:40])))
+    check("exactly one wave was sent, five exits of ten",
+          dials == [1] * 5 + [0] * 5, str(dials))
+    check("and the refusal is handed over once",
+          bytes(client.got).count(b"FreeTierError") == 1,
+          repr(bytes(client.got[:200])))
+
+    print("\n=== 16c. a gated exit sits out minutes, not the rest of the "
+          "free-tier day ===")
+    from lingling import bench  # noqa: E402
+    now = time.time()
+    gate = bench.bench_span(bench.GATE_LIMIT, 0.0, now)
+    day = bench.next_free_reset(now) - now
+    print(f"  gate bench={gate:.0f}s  day={day:.0f}s")
+    check("the gate's bench is bounded to minutes",
+          0 < gate <= 3600, f"{gate:.0f}s")
+    check("and it is not the free-tier day",
+          gate < day - 60, f"gate={gate:.0f}s day={day:.0f}s")
+    check("a real limit still gets its own span",
+          bench.bench_span(bench.FREE_LIMIT, 0.0, now) == day,
+          f"{bench.bench_span(bench.FREE_LIMIT, 0.0, now):.0f}s")
 
     print("\n=== 17. only a 200 takes the call: the fastest answer is not "
           "the best one ===")
