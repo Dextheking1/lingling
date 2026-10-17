@@ -12,7 +12,7 @@ from .health import UPSTREAM_HOST, UPSTREAM_UA, HealthDaemon
 from .lanes import TorManager
 
 MODEL = os.environ.get("LINGLING_DEMO_MODEL",
-                       "muse-spark-1.3-contributor-free")
+                       "deepseek-v4.1-flash-free")
 
 
 def _say(msg: str) -> None:

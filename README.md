@@ -49,7 +49,7 @@ fast. A losing lane's 429 is shown too -- that is the pool working, not your
 call failing.
 
 ```
-14:19:24  #208.1  lanes 1,2,3,5,4 {us,nl,de,at,se}  ->  muse-spark-1.3-contributor-free
+14:19:24  #208.1  lanes 1,2,3,5,4 {us,nl,de,at,se}  ->  deepseek-v4.1-flash-free
 14:19:24    | #208.1 lane 5 {at} 429 free limit -- exit out until 05:30 (00:00 UTC) -- moving it  0.1 KB in 7.4s
 14:19:25    | #208.1 lane 4 {se} 200 29.7 KB in 7.7s  first 5.8s  event 7.44s
 14:19:27  * lane 5 was refused (429) -- moved to {se}
@@ -62,7 +62,7 @@ your tokens are flowing through a German exit. `--no-proof` if you trust us.
 
 ### How a limit dies without you noticing
 
-Six different things can go wrong, and they are kept strictly apart.
+A lot of things can go wrong here, and they are kept strictly apart.
 
 Two 429s, and they are not the same thing. The lane is moved to another exit
 for both; what differs is which **notepad section** that exit is written into.
@@ -103,16 +103,32 @@ is opencode's own edge having a bad moment, so it is never written into the
 notepad at all and the pane says so loudly: `429 OPENCODE EDGE UNAVAILABLE --
 not this exit`.
 
+**The gate's refusal (403).** Some exits are refused outright —
+`FreeTierError`, the gate's answer to a client it will not credit for the free
+tier through that address. Nothing about the lane or its tor is wrong, so no
+lane moves. But it is not your answer either, and refusing is cheaper than
+answering, so a gated lane always reaches the race *first*. It is held back
+like a 429 is: the call goes on to the lanes that can still serve, and only a
+pool where every exit is gated hands the 403 over. That exit is then sat out
+for the rest of the free-tier day rather than raced on every call, and the
+sweep moves its lane somewhere else: `lane 9 {fr} 403 -- the gate closed this
+exit, sitting it out`. The pane still shows the attempt that found it, so you
+can see which exits the gate has closed.
+
 **Load.** How much a lane is carrying decides where it sits in the race,
 never whether it keeps serving. A loaded lane is healthy and still ours, so
 nothing is retired for it — and nothing queues either, because the request
-already went out on every live lane at once. The quickest answer wins.
+already went out on every live lane at once. **The quickest 200 wins** — and
+nothing but a 200 may take the call.
 
 **The far end's bad moments.** A 502, 503 or 504 means opencode's edge is
 unwell — not your client, and not that exit's quota. A different exit reaches
 a different edge, so those are retried on another lane exactly like a 429. A
-plain 500 is *not* retried: that may be a genuine error, and repeating it
-would just fail twice.
+plain 500 is not allowed to take the call either, for the same reason a 403
+isn't: it is the cheapest thing a bad lane can send, and the lane beside it
+may still be one second away from your answer. An error only reaches you when
+the whole pool answered with errors — and then it is the far end's own words,
+not an invented one.
 
 **A slow exit.** If a lane makes your answer wait 20s for its first token, it
 is written off on the spot — the same treatment a 429 gets — and your next
@@ -177,7 +193,7 @@ se, pl, ch). Want different exits? Drop a `countries.txt` into Lingling's
 data directory (`%LOCALAPPDATA%\Temp\lingling-data` on Windows):
 
 ```
-# big pools first: the six boot lanes take the first six here
+# big pools first: the ten boot lanes take the first ten here
 de,nl,se,at,lu,fr,us,no,ch,hu,it,fi
 # fallback, used once the primary pool is exhausted
 sg,ro,cz,pl,bg,is,dk,za,ca,gb
@@ -202,14 +218,25 @@ move. If a country does run out, that lane falls back to letting Tor choose.
 
 | Flag | What it does |
 |---|---|
-| `--lanes N` | how many lanes to keep warm (default 5, env `LINGLING_TOR_COUNT`) |
+| `--lanes N` | how many lanes to keep warm (default 10, env `LINGLING_TOR_COUNT`) |
 | `--no-tor` | skip the lanes, run opencode on your own IP like a civilian |
 | `--no-proof` | no proof window (coward's mode) |
-| `--demo [question]` | fire one real Muse Spark request through a lane, show receipts |
+| `--demo [question]` | fire one real request through a lane, show receipts (`LINGLING_DEMO_MODEL` picks the model) |
 | `uninstall [--yes]` | wipe the lanes, Tor bundle, geoip and logs (keeps `countries.txt`) |
 
 Everything else is handed to opencode byte-for-byte. We don't touch it,
 we don't parse it, we don't want to know.
+
+### Leaving an exit before it is spent
+
+An exit IP's daily allowance belongs to whoever reaches it first, and the only
+way to find out that somebody else got there is to be refused. So lanes leave
+early instead: after `LINGLING_EXIT_SOFT_CAP` requests through one address
+(default: half of `LINGLING_EXIT_CAP`), or after `LINGLING_EXIT_HOLD_S` seconds
+riding it (default 600). The second one exists because the requests other
+people put through that address show up in no ledger we keep. Each cycle the
+sweep takes up to `LINGLING_SWEEP_MOVES` lanes (default 3), every
+`LINGLING_SWEEP_S` seconds (default 20), longest-riding first.
 
 ### Under the hood
 

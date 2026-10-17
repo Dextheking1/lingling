@@ -29,7 +29,7 @@ PROOF_LOG = DATA_DIR / "proof.log"
 
 DEFAULT_COUNTRIES = ["us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"]
 
-DEFAULT_LANES = 5
+DEFAULT_LANES = 10
 
 MAX_LANES = 64
 
@@ -314,10 +314,10 @@ Add --yes to skip the confirmation prompt.
 """
 
 
-def _running_children() -> list:
-    """Lingling's helpers that lock the data dir, as (name, count)."""
+def _process_table() -> tuple:
+    """Every process on this machine: its name, and who started it."""
     if os.name != "nt":
-        return []
+        return {}, {}
     import ctypes
     import ctypes.wintypes as wt
     TH32CS_SNAPPROCESS = 0x2
@@ -357,12 +357,26 @@ def _running_children() -> list:
                 if not k.Process32Next(snap, ctypes.byref(entry)):
                     break
         k.CloseHandle(snap)
+    return names, parents
+
+
+def _lineage(names: dict, parents: dict) -> set:
+    """This process and the lingling exe that launched it."""
     mine = {os.getpid()}
     pid = parents.get(os.getpid())
     while pid and pid in parents and len(mine) < 8:
         if names.get(pid, "").startswith("lingling"):
             mine.add(pid)
         pid = parents.get(pid)
+    return mine
+
+
+def _running_children() -> list:
+    """Lingling's helpers that lock the data dir, as (name, count)."""
+    names, parents = _process_table()
+    if not names:
+        return []
+    mine = _lineage(names, parents)
     counts = {}
     for pid, name in names.items():
         if pid in mine:
@@ -370,6 +384,24 @@ def _running_children() -> list:
         if name in ("tor.exe", "opencode.exe", "lingling.exe"):
             counts[name] = counts.get(name, 0) + 1
     return sorted(counts.items())
+
+
+def _opencode_already_open() -> list:
+    """OpenCode windows that were running before the handoff, by pid.
+
+    Their background service is the one opencode keeps between windows, and
+    the window that started it hands it that window's environment -- so a
+    service already up cannot be given the lanes' proxy by restarting it.
+    Nothing then reaches the relay: every call rides the machine's own address
+    while the lanes sit idle, and the pane has nothing to show.  Only a fresh
+    window, started by lingling, spawns a service that inherits the proxy.
+    """
+    names, parents = _process_table()
+    if not names:
+        return []
+    mine = _lineage(names, parents)
+    return sorted(pid for pid, name in names.items()
+                  if name == "opencode.exe" and pid not in mine)
 
 
 def _uninstall(rest: list[str]) -> int:
@@ -624,6 +656,16 @@ def _session(opts: dict, opencode: str) -> int:
 
             threading.Thread(target=_cook_rest, name="lane-cook",
                              daemon=True).start()
+
+        stale = _opencode_already_open()
+        if stale:
+            listed = ", ".join(str(pid) for pid in stale)
+            print(_c(f" !! OpenCode was already running ({listed}) -- its "
+                     f"background service predates these lanes and will not "
+                     f"use them. Close every OpenCode window and run "
+                     f"lingling again.", "31"), flush=True)
+            print(_c("    Until you do, whatever you send rides your own "
+                     "address, not a lane.", "33"), flush=True)
 
         env = dict(os.environ)
         for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
