@@ -1,5 +1,13 @@
 """The limit bench: what a limited exit earned, and how long it sits out.
 
+A gated exit sits out ``GATE_COOLDOWN_S``, not the free-tier day.  The gate's
+403 names the CLIENT ("the free tier can only be used from within OpenCode"),
+not the exit, and it refuses every exit in a wave at once.  Benching each of
+them until 00:00 UTC is what turned one tripped call into a dead pool:
+measured 2026-10-18, fifty refusals in ninety seconds wrote the fleet off for
+the rest of the day.  A few minutes stops us re-racing the exit and still lets
+the pool come back on its own.
+
 Two ledgers live here, both keyed to the 00:00 UTC the free tier resets on.
 The notepad holds what an exit was benched for.  The spend ledger holds how
 much of that day we have put through each exit ourselves, which is what lets a
@@ -52,6 +60,10 @@ EXIT_SOFT_CAP = bounds.count("LINGLING_EXIT_SOFT_CAP",
 
 EXIT_HOLD_S = bounds.number("LINGLING_EXIT_HOLD_S", 600, 0.0, bounds.WINDOW_S)
 
+#: gate cooldown
+GATE_COOLDOWN_S = bounds.number("LINGLING_GATE_COOLDOWN_S", 300,
+                                0.0, bounds.WINDOW_S)
+
 
 def day_of(now: Optional[float] = None) -> int:
     """Which free-tier day ``now`` falls in: the 00:00 UTC that owns it."""
@@ -72,6 +84,8 @@ def bench_span(reason: str, retry_after: float = 0.0,
     if reason == RATE_LIMIT:
         return (min(retry_after, RATE_LIMIT_FALLBACK_S) if retry_after > 0
                 else RATE_LIMIT_FALLBACK_S)
+    if reason == GATE_LIMIT:
+        return min(GATE_COOLDOWN_S, _LIMIT_CEILING_S)
     if retry_after > 0:
         return min(retry_after, _LIMIT_CEILING_S)
     return min(next_free_reset(moment) - moment, _LIMIT_CEILING_S)
