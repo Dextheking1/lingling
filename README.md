@@ -7,9 +7,16 @@ you by IP, so right when the conversation gets good — bam, wall. Very rude.
 
 Lingling fixes this the fun way. It spins up a little kitchen of Tor exit
 lanes on your machine, each one a different country, and sends every request
-down **all** of them at once. The first answer takes it; the rest are cut
+down **five** of them at once. The first answer takes it; the rest are cut
 before they say a word. One exit gets throttled? Cute. Four of them do, and
 you are answered by the fifth without ever noticing. You just keep typing.
+
+Five, not the whole fleet, and that number is measured rather than shy. The
+free tier refuses a client it sees arrive from half a dozen addresses for the
+same session — `403 FreeTierError` — and once it has refused that client, it
+refuses it through every exit. Ten lanes are still worth having: they spread
+the day's allowance and give the sweep somewhere to move a lane to. Ten copies
+of one call are not.
 
 ```
 pip install lingling
@@ -109,17 +116,28 @@ tier through that address. Nothing about the lane or its tor is wrong, so no
 lane moves. But it is not your answer either, and refusing is cheaper than
 answering, so a gated lane always reaches the race *first*. It is held back
 like a 429 is: the call goes on to the lanes that can still serve, and only a
-pool where every exit is gated hands the 403 over. That exit is then sat out
-for the rest of the free-tier day rather than raced on every call, and the
-sweep moves its lane somewhere else: `lane 9 {fr} 403 -- the gate closed this
-exit, sitting it out`. The pane still shows the attempt that found it, so you
-can see which exits the gate has closed.
+wave where every exit is gated hands the 403 over — and then the call stops
+there. The refusal is about the *client*, not the exit, so walking the other
+five exits on the same call pays for the same wall twice and is what makes the
+gate stick; the far end's own words reach the client instead. That exit then
+sits out a few minutes (`LINGLING_GATE_COOLDOWN_S`, default 300) rather than
+the rest of the free-tier day, and the sweep moves its lane somewhere else:
+`lane 9 {fr} 403 -- the gate closed this exit, sitting it out`. The pane still
+shows the attempt that found it, so you can see which exits the gate has
+closed.
+
+Why minutes and not a day: on 2026-10-18 a ten-lane session took fifty of
+these refusals in ninety seconds, and each one wrote its exit off until 00:00
+UTC. The pool was dead for the rest of the day even though the gate had never
+said a word about any of those exits. A gate is a verdict about what we look
+like, not about where we are standing.
 
 **Load.** How much a lane is carrying decides where it sits in the race,
 never whether it keeps serving. A loaded lane is healthy and still ours, so
 nothing is retired for it — and nothing queues either, because the request
-already went out on every live lane at once. **The quickest 200 wins** — and
-nothing but a 200 may take the call.
+already went out on its wave of five at once. **The quickest 200 wins** — and
+nothing but a 200 may take the call. `LINGLING_RACE_WIDTH` widens or narrows
+that wave (default 5); the lanes that were not in it take the next call.
 
 **The far end's bad moments.** A 502, 503 or 504 means opencode's edge is
 unwell — not your client, and not that exit's quota. A different exit reaches
