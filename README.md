@@ -222,6 +222,7 @@ move. If a country does run out, that lane falls back to letting Tor choose.
 | `--no-tor` | skip the lanes, run opencode on your own IP like a civilian |
 | `--no-proof` | no proof window (coward's mode) |
 | `--demo [question]` | fire one real request through a lane, show receipts (`LINGLING_DEMO_MODEL` picks the model) |
+| `update [--check] [--now]` | ask what the newest lingling is, and install it between sessions |
 | `uninstall [--yes]` | wipe the lanes, Tor bundle, geoip and logs (keeps `countries.txt`) |
 
 Everything else is handed to opencode byte-for-byte. We don't touch it,
@@ -237,6 +238,26 @@ riding it (default 600). The second one exists because the requests other
 people put through that address show up in no ledger we keep. Each cycle the
 sweep takes up to `LINGLING_SWEEP_MOVES` lanes (default 3), every
 `LINGLING_SWEEP_S` seconds (default 20), longest-riding first.
+
+### Staying current
+
+A copy of lingling has the code it was installed with, and nothing outside can
+change that. So the launch asks one small manifest what the newest version is:
+a background request, three seconds at most, silent unless there is something
+to say. When there is, it says so once the lanes are hot -- `lingling
+2.1.20.post35 is out (you are on 2.1.20.post34)` -- and offers to install it
+when this session ends (Enter or `y` takes it, `n` leaves it for later).
+Windows will not let pip replace the console launcher while it is running, so
+the install waits for this process to exit and lands in the gap between two
+launches.
+
+How long an answer is trusted depends on what it said: "you are current" for
+fifteen minutes, "an update is out" for six hours. A release published a
+minute after a launch is therefore picked up by the next launch, not by the one
+after lunch. `lingling update --check` asks right now and changes nothing;
+`lingling update` asks and schedules the install. `LINGLING_UPDATE=off` (or
+`LINGLING_NO_UPDATE_CHECK=1`) stops the check entirely; `LINGLING_UPDATE=notify`
+keeps the notice and drops the question.
 
 ### Under the hood
 
@@ -261,4 +282,7 @@ Runtime state (tor, lanes, proof log, local CA) lives in the per-user data
 directory — never in the package, never in your project folder.
 
 Requirements: Python 3.11+, Windows/macOS/Linux, and `opencode` on your PATH.
-Runs entirely on your machine. Nothing calls home. The kitchen is local.
+Runs entirely on your machine. The one outbound call that is not your own
+traffic is the update check above -- a GET for a small manifest (PyPI's index
+if that fails), carrying nothing but the version you are on. Nothing else
+calls home, and nothing is collected. The kitchen is local.

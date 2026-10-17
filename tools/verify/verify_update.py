@@ -270,6 +270,16 @@ def section_check(url):
               bad, now=time.time() + update.FAIL_TTL + 1))
     check("a good answer eventually expires too",
           not update.fresh(good, now=time.time() + update.CACHE_TTL + 1))
+    #: The answer every launch reads, and the one a release invalidates.
+    current = {"latest": CURRENT, "checked_at": time.time()}
+    check("being current is not remembered for hours",
+          update.fresh(current)
+          and not update.fresh(current, now=time.time() + update.UP_TTL + 1),
+          f"UP_TTL={update.UP_TTL}, CACHE_TTL={update.CACHE_TTL}")
+    check("a hint still lives longer than a stale all-clear",
+          update.UP_TTL < update.CACHE_TTL
+          and update.fresh(good, now=time.time() + update.UP_TTL + 1),
+          f"UP_TTL={update.UP_TTL} CACHE_TTL={update.CACHE_TTL}")
     check("a timestamp from the future is not trusted",
           not update.fresh(bad, now=time.time() - 10))
 

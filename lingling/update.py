@@ -22,6 +22,10 @@ PYPI_URL = "https://pypi.org/pypi/lingling/json"
 SCHEMA = 1
 
 CACHE_TTL = 6 * 3600
+
+#: quarter hour
+UP_TTL = 15 * 60
+
 FAIL_TTL = 3600
 
 TIMEOUT = 3.0
@@ -299,7 +303,14 @@ def _write_cache(data_dir, info: dict) -> None:
 
 
 def fresh(info: Optional[dict], now: Optional[float] = None) -> bool:
-    """Is this cached answer still worth acting on?"""
+    """Is this cached answer still worth acting on?
+
+    How long an answer keeps depends on what it said.  "Something newer is out"
+    is worth repeating for hours -- a launch that has already been told needs no
+    second request to be told again.  "You are current" is not: it is the answer
+    that a release invalidates the moment it is uploaded, and every launch reads
+    it, so a stale one is a release nobody hears about.
+    """
     if not isinstance(info, dict):
         return False
     try:
@@ -307,7 +318,13 @@ def fresh(info: Optional[dict], now: Optional[float] = None) -> bool:
             info.get("checked_at") or 0)
     except (TypeError, ValueError):
         return False
-    return 0 <= age < (CACHE_TTL if info.get("latest") else FAIL_TTL)
+    if behind(info):
+        ttl = CACHE_TTL
+    elif info.get("latest"):
+        ttl = UP_TTL
+    else:
+        ttl = FAIL_TTL
+    return 0 <= age < ttl
 
 
 def check(data_dir, force: bool = False, timeout: float = TIMEOUT) -> dict:
